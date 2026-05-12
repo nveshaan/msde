@@ -459,10 +459,12 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "matplotlib" },
+    { name = "numba" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "scanpy" },
     { name = "scikit-learn" },
+    { name = "scipy" },
     { name = "seaborn" },
     { name = "umap-learn" },
 ]
@@ -470,10 +472,12 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "matplotlib", specifier = ">=3.10.9" },
+    { name = "numba", specifier = ">=0.65.1" },
     { name = "numpy", specifier = ">=2.4.4" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "scanpy", specifier = ">=1.12.1" },
     { name = "scikit-learn", specifier = ">=1.8.0" },
+    { name = "scipy", specifier = ">=1.17.1" },
     { name = "seaborn", specifier = ">=0.13.2" },
     { name = "umap-learn", specifier = ">=0.5.12" },
 ]
