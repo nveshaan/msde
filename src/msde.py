@@ -1,3 +1,5 @@
+# Source: https://github.com/D6nam853/medi-msde/blob/main/msde/msde.py
+
 import numpy as np
 from scipy.spatial import cKDTree
 from umap.umap_ import fuzzy_simplicial_set, nearest_neighbors
@@ -8,10 +10,6 @@ from scipy.special import expit
 from numba import njit, prange
 from pynndescent import NNDescent
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Core manifold-shift utilities
-# ─────────────────────────────────────────────────────────────────────────────
 
 def count_points_within_radius(X, tree, epsilon):
     neighbors = tree.query_ball_tree(tree, epsilon)
@@ -123,6 +121,7 @@ def get_empirical_weights(
     return np.concatenate(weights_all)
 
 
+# TODO: consider vectorizing the loops
 @njit(fastmath=True, parallel=True)
 def shift_data(X, indices, weights, learning_rate):
     n, k = indices.shape
@@ -155,11 +154,12 @@ def shift_data(X, indices, weights, learning_rate):
             scale = learning_rate * dist
             for t in range(d):
                 revised_d[i, t] = (X[i, t]
-                                   + scale * (revised_d[i, t] - X[i, t]) / dist)
+                                   + scale * (revised_d[i, t] - X[i, t]) / dist) # BUG: add 1e-6 for numerical stability?
         else:
             for t in range(d):
                 revised_d[i, t] = X[i, t]
 
+    # BUG: change is inconsistent with the papers. is it intended change or is it applied change
     return revised_d, change
 
 
@@ -175,8 +175,9 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
 
     shifted_dataset = X.copy()
     total_distance  = np.zeros(X.shape[0])
+    trajectories = [shifted_dataset]
 
-    for _ in range(max_iters_shift):
+    for _ in range(max_iters_shift):        
         index = NNDescent(
             shifted_dataset, n_neighbors=k,
             metric="euclidean", random_state=42
@@ -189,12 +190,14 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
         )
         total_distance += change
         shifted_dataset  = revised_d
+        trajectories.append(shifted_dataset)
 
         if change.mean() < shift_threshold:
             break
         print('')
 
-    return shifted_dataset, total_distance
+    trajectories = np.stack(trajectories, axis=0)
+    return shifted_dataset, trajectories, total_distance
 
 
 def mean_shift_density_enhancement(X, k=50, nbd_sample_count_threshold=70,
@@ -206,10 +209,6 @@ def mean_shift_density_enhancement(X, k=50, nbd_sample_count_threshold=70,
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# GDE scorer  — fixed: pca_dim=256
-# ─────────────────────────────────────────────────────────────────────────────
-
 class _GDEScorer:
     """
     Gaussian Density Estimator on PCA-256 projected shifted features.
@@ -217,8 +216,8 @@ class _GDEScorer:
     Higher score → more anomalous.
     """
 
-    GDE_PCA_DIM = 256   # fixed across all datasets
-    REG         = 1e-4  # covariance regularisation
+    GDE_PCA_DIM = 256
+    REG         = 1e-4
 
     def __init__(self):
         self._pca     = None
@@ -246,10 +245,6 @@ class _GDEScorer:
         return np.sqrt(np.clip(maha2, 0, None))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# MSDE  —  fixed: score_mode='gde', gde_pca_dim=256
-# ─────────────────────────────────────────────────────────────────────────────
-
 class MSDE:
     """
     Manifold-Shift Manifold Learning anomaly detector.
@@ -258,6 +253,7 @@ class MSDE:
     Only the five shift hyperparameters need to be tuned.
     """
 
+    # TODO: add cumulative displacement anamoly scoring
     def __init__(
         self,
         seed: int,
@@ -282,12 +278,11 @@ class MSDE:
         self.X_train_ref                = None
         self._gde                       = None
 
-    # ── fit ──────────────────────────────────────────────────────────────────
     def fit(self, X_train, y_train=None):
         self.X_train_ref = np.asarray(X_train).copy()
 
         # Shift training normals and fit GDE on the shifted positions
-        X_shifted_train, _ = mean_shift_density_enhancement(
+        X_shifted_train, X_traj_train, X_dist_train = mean_shift_density_enhancement(
             self.X_train_ref,
             k=self.k,
             nbd_sample_count_threshold=self.nbd_sample_count_threshold,
@@ -296,9 +291,8 @@ class MSDE:
             shift_threshold=self.shift_threshold,
         )
         self._gde = _GDEScorer().fit(X_shifted_train)
-        return self
+        return X_shifted_train, X_traj_train, X_dist_train
 
-    # ── predict_score ─────────────────────────────────────────────────────────
     def predict_score(self, X):
         X = np.asarray(X)
 
@@ -309,7 +303,7 @@ class MSDE:
         X_all = np.vstack([self.X_train_ref, X])
         n_train = len(self.X_train_ref)
 
-        X_shifted_all, _ = mean_shift_density_enhancement(
+        X_shifted_all, _, _ = mean_shift_density_enhancement(
             X_all,
             k=self.k,
             nbd_sample_count_threshold=self.nbd_sample_count_threshold,
