@@ -159,7 +159,7 @@ def shift_data(X, indices, weights, learning_rate):
             for t in range(d):
                 revised_d[i, t] = X[i, t]
 
-    # BUG: change is inconsistent with the papers. is it intended change or is it applied change
+    # BUG: change is inconsistent with the papers. is it intended change or is it applied change?
     return revised_d, change
 
 
@@ -292,6 +292,10 @@ class MSDE:
         )
         self._gde = _GDEScorer().fit(X_shifted_train)
         return X_shifted_train, X_traj_train, X_dist_train
+    
+    # TODO: implement partial_fit
+    def partial_fit(self):
+        raise NotImplementedError
 
     def predict_score(self, X):
         X = np.asarray(X)

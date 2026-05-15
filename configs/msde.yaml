@@ -1,0 +1,16 @@
+data: hcla
+
+pca:
+  batch_size: 1000
+  n_components: 50
+  save_file: ${data}_${pca.n_components}
+
+msde:
+  _target_: src.msde.MSDE
+  k: 50
+  nbd_sample_count_threshold: 70
+  learning_rate: 0.33
+  max_iters_shift: 8
+  shift_threshold: 0.01
+  anomalyThreshold: 0.22
+  scaler: null
