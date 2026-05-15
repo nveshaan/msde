@@ -15,10 +15,13 @@ def main(cfg: DictConfig) -> None:
 
     batch_size = cfg.pca.batch_size
     n = adata.X.shape[0]
+    indices = np.arange(n)
+    np.random.shuffle(indices)
     
     pca = IncrementalPCA(cfg.pca.n_components, batch_size=batch_size)
     for i in tqdm(range(0, n, batch_size), desc="Fitting PCA"):
-        pca.partial_fit(adata.X[i:i+batch_size].toarray())
+        idx = indices[i:i+batch_size]
+        pca.partial_fit(adata.X[idx].toarray())
         
     X_pca = []
     for i in tqdm(range(0, n, batch_size), desc="Transforming X"):
