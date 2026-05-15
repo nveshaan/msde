@@ -4,7 +4,7 @@ import scanpy as sc
 import numpy as np
 from sklearn.decomposition import IncrementalPCA
 from tqdm import tqdm
-
+import joblib
 
 @hydra.main(version_base=None, config_path="../configs", config_name="msde")
 def main(cfg: DictConfig) -> None:
@@ -27,9 +27,11 @@ def main(cfg: DictConfig) -> None:
     for i in tqdm(range(0, n, batch_size), desc="Transforming X"):
         X_pca.append(pca.transform(adata.X[i:i+batch_size].toarray()))
 
-    X_pca = np.stack(X_pca)
-    save_path = "data/" + cfg.pca.save_file + ".npy"
-    np.save(save_path, X_pca)
+    X_pca = np.concatenate(X_pca)
+    save_path = "data/" + cfg.pca.save_file
+    np.save(save_path + ".npy", X_pca)
+    print("Saved PCA Embeddings")
+    joblib.dump(pca, save_path + ".joblib")
     print("Saved PCA Components")
 
 
