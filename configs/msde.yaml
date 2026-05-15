@@ -14,3 +14,4 @@ msde:
   shift_threshold: 0.01
   anomalyThreshold: 0.22
   scaler: null
+  anomalyScore: null

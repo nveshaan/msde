@@ -13,6 +13,18 @@ wget -P ./data https://datasets.cellxgene.cziscience.com/dbb5ad81-1713-4aee-8257
 mv ./data/dbb5ad81-1713-4aee-8257-396fbabe7c6e.h5ad ./data/hcla.h5ad
 ```
 
+## Run
+
+Use PCA to reduce the dimensions in data.
+```bash
+python -m scripts.reduce_dim
+```
+
+Run MSDE to get the trajectories and distances.
+```bash
+python -m scripts.run_msde
+```
+
 ## Acknowledgements
 
 - Kar, P., Bordoloi, R., Wolkenhauer, O., & Bej, S. (2026). Anomaly Detection via Mean Shift Density Enhancement. arXiv:2602.03293. https://doi.org/10.48550/arXiv.2602.03293
