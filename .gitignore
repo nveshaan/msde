@@ -1,5 +1,6 @@
 data
 outputs
+temp
 __pycache__
 
 .DS_Store

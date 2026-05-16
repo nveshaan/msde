@@ -17,3 +17,4 @@ msde:
   anomalyThreshold: 0.22
   scaler: null
   anomalyScore: null
+  path: ${pca.save_file}
