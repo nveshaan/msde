@@ -7,6 +7,8 @@ pca:
 
 msde:
   _target_: src.msde.MSDE
+  seed: 42
+  batch_size: 1000
   k: 50
   nbd_sample_count_threshold: 70
   learning_rate: 0.33

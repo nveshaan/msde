@@ -113,7 +113,7 @@ def get_empirical_weights(
     effective_batch_size = min(batch_size, max(n_neighbors * 3, 100))
     total_batches = (len(X) + effective_batch_size - 1) // effective_batch_size
     weights_all = []
-    for batch_idx in range(total_batches):
+    for batch_idx in tqdm(range(total_batches), desc="Calculating Emperical Weights"):
         start = batch_idx * effective_batch_size
         end   = min(len(X), start + effective_batch_size)
         X_batch = X[start:end]
@@ -165,13 +165,13 @@ def shift_data(X, indices, weights, learning_rate):
 
 
 def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
-                   max_iters_shift, shift_threshold):
+                   max_iters_shift, shift_threshold, batch_size):
     weights = get_empirical_weights(
         X,
         nbd_sample_count_threshold=nbd_sample_count_threshold,
         max_iters_weight_count=4,
         satisfiability_proportion=0.3,
-        batch_size=1000
+        batch_size=batch_size
     )
 
     shifted_dataset  = X.copy()
@@ -179,7 +179,7 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
     feature_distance = np.zeros(X.shape[1])
     trajectories = [shifted_dataset]
 
-    for _ in tqdm(range(max_iters_shift), desc="MSDE"):        
+    for i in tqdm(range(max_iters_shift), desc="MSDE"):        
         index = NNDescent(
             shifted_dataset, n_neighbors=k,
             metric="euclidean", random_state=42
@@ -197,7 +197,7 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
         trajectories.append(shifted_dataset)
 
         if total_change.mean() < shift_threshold:
-            print("Total change converged. Exiting the loop.")
+            print(f"Total change converged after iteration {i}. Exiting the loop.")
             break
 
     trajectories = np.stack(trajectories, axis=0)
@@ -206,10 +206,10 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
 
 def mean_shift_density_enhancement(X, k=50, nbd_sample_count_threshold=70,
                                  learning_rate=0.33, max_iters_shift=8,
-                                 shift_threshold=0.01):
+                                 shift_threshold=0.01, batch_size=1000):
     return get_shift_fast(
         X, k, nbd_sample_count_threshold,
-        learning_rate, max_iters_shift, shift_threshold
+        learning_rate, max_iters_shift, shift_threshold, batch_size
     )
 
 
@@ -269,7 +269,8 @@ class MSDE:
         shift_threshold: float = 0.01,
         anomalyThreshold: float = 0.22,
         scaler=None,
-        anomalyScore = 'GDE'
+        anomalyScore = 'GDE',
+        batch_size: int = 1000,
     ):
         self.k                          = k
         self.nbd_sample_count_threshold = nbd_sample_count_threshold
@@ -283,6 +284,7 @@ class MSDE:
         self.X_train_ref                = None
         self._gde                       = None
         self.anomalyScore               = anomalyScore
+        self.batch_size                 = batch_size
 
     def fit(self, X_train, y_train=None):
         self.X_train_ref = np.asarray(X_train).copy()
@@ -295,6 +297,7 @@ class MSDE:
             learning_rate=self.learning_rate,
             max_iters_shift=self.max_iters_shift,
             shift_threshold=self.shift_threshold,
+            batch_size=self.batch_size,
         )
         if self.anomalyScore == 'GDE':
             self._gde = _GDEScorer().fit(X_shifted)
@@ -324,6 +327,7 @@ class MSDE:
             learning_rate=self.learning_rate,
             max_iters_shift=self.max_iters_shift,
             shift_threshold=self.shift_threshold,
+            batch_size=self.batch_size,
         )
 
         # Score test points via GDE fitted on training normals
