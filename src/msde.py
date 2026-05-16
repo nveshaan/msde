@@ -199,7 +199,7 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
         revised_d, total_change = shift_data(
             shifted_dataset, indices, weights, learning_rate
         )
-        feature_change = np.sum(revised_d - shifted_dataset, axis=0)
+        feature_change = np.sum(np.abs(revised_d - shifted_dataset), axis=0)
         total_distance += total_change
         feature_distance += feature_change
         shifted_dataset  = revised_d
