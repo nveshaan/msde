@@ -19,3 +19,4 @@ msde:
   scaler: null
   anomalyScore: null
   path: data/${data}_${pca.n_components}pc_weights.npy
+  nn: annoy

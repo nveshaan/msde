@@ -11,6 +11,7 @@ from numba import njit, prange
 from pynndescent import NNDescent
 from tqdm import tqdm
 import os
+from annoy import AnnoyIndex
 
 
 def count_points_within_radius(X, tree, epsilon):
@@ -165,7 +166,7 @@ def shift_data(X, indices, weights, learning_rate):
     return revised_d, total_change
 
 
-def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
+def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate, nn,
                    max_iters_shift, shift_threshold, batch_size, path):
     if os.path.exists(path):
         print("Loading saved weights.")
@@ -188,12 +189,25 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
 
     pbar = tqdm(range(max_iters_shift), desc="MSDE")
     for i in pbar:
-        index = NNDescent(
-            shifted_dataset, n_neighbors=k,
-            metric="euclidean", random_state=42
-        )
-        indices, _ = index.neighbor_graph
-        indices    = indices.astype(np.int64)
+        if nn=="nndescent":
+            index = NNDescent(
+                shifted_dataset, n_neighbors=k, n_jobs=-1,
+                metric="euclidean", random_state=42
+            )
+            indices, _ = index.neighbor_graph
+        elif nn=="annoy":
+            # n_trees, search_k are the two main params to tune Annoy.
+            d = shifted_dataset.shape[1]
+            annoy_index = AnnoyIndex(d, 'euclidean')
+            for idx in range(shifted_dataset.shape[0]):
+                annoy_index.add_item(idx, shifted_dataset[idx])
+                
+            annoy_index.build(n_trees=50, n_jobs=-1) 
+            indices = np.empty((shifted_dataset.shape[0], k), dtype=np.int64)
+            for idx in range(shifted_dataset.shape[0]):
+                indices[idx] = annoy_index.get_nns_by_item(idx, k, search_k=-1)
+
+        indices = indices.astype(np.int64)
 
         revised_d, total_change = shift_data(
             shifted_dataset, indices, weights, learning_rate
@@ -201,7 +215,7 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
         feature_change = np.sum(np.abs(revised_d - shifted_dataset), axis=0)
         total_distance += total_change
         feature_distance += feature_change
-        shifted_dataset  = revised_d
+        shifted_dataset = revised_d
         np.save(f"temp/traj_{i+1}.npy", shifted_dataset)
 
         if total_change.mean() < shift_threshold:
@@ -217,9 +231,9 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
 def mean_shift_density_enhancement(X, k=50, nbd_sample_count_threshold=70,
                                  learning_rate=0.33, max_iters_shift=8,
                                  shift_threshold=0.01, batch_size=1000,
-                                 path=None,):
+                                 path=None, nn="nndescent"):
     return get_shift_fast(
-        X, k, nbd_sample_count_threshold, learning_rate,
+        X, k, nbd_sample_count_threshold, learning_rate, nn,
         max_iters_shift, shift_threshold, batch_size, path,
     )
 
@@ -283,6 +297,7 @@ class MSDE:
         anomalyScore = 'GDE',
         batch_size: int = 1000,
         path: str = None,
+        nn: str = "nndescent",
     ):
         self.k                          = k
         self.nbd_sample_count_threshold = nbd_sample_count_threshold
@@ -298,6 +313,7 @@ class MSDE:
         self.anomalyScore               = anomalyScore
         self.batch_size                 = batch_size
         self.path                       = path
+        self.nn                         = nn
 
     def fit(self, X_train, y_train=None):
         self.X_train_ref = np.asarray(X_train).copy()
@@ -312,6 +328,7 @@ class MSDE:
             shift_threshold=self.shift_threshold,
             batch_size=self.batch_size,
             path=self.path,
+            nn=self.nn,
         )
         if self.anomalyScore == 'GDE':
             self._gde = _GDEScorer().fit(X_shifted)
@@ -343,6 +360,7 @@ class MSDE:
             shift_threshold=self.shift_threshold,
             batch_size=self.batch_size,
             path=self.path,
+            nn=self.nn,
         )
 
         # Score test points via GDE fitted on training normals
