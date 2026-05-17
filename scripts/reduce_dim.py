@@ -5,7 +5,6 @@ import numpy as np
 from sklearn.decomposition import IncrementalPCA
 from tqdm import tqdm
 import joblib
-import h5py
 
 @hydra.main(version_base=None, config_path="../configs", config_name="msde")
 def main(cfg: DictConfig) -> None:
@@ -29,13 +28,12 @@ def main(cfg: DictConfig) -> None:
         X_pca.append(pca.transform(adata.X[i:i+batch_size].toarray()))
 
     X_pca = np.concatenate(X_pca)
-    save_path = "data/" + cfg.pca.save_file
-    with h5py.File(save_path + ".hdf5") as f:
-        if "pca" in f:
-            del f["pca"]
-        f["pca"] = X_pca    
+    save_path = "data/" + str(cfg.pca.path) + ".npy"
+    np.save(save_path, X_pca)
     print("Saved PCA Embeddings")
-    joblib.dump(pca, save_path + ".joblib")
+
+    save_path = "data/" + str(cfg.pca.path) + ".joblib"
+    joblib.dump(pca, save_path)
     print("Saved PCA Components")
 
 

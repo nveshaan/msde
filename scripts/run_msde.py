@@ -12,14 +12,16 @@ def main(cfg: DictConfig) -> None:
 
     msde = instantiate(cfg.msde)
 
-    file_path = "data/" + cfg.pca.save_file + ".npy"
-    X = np.load(file_path)
+    path = str(cfg.pca.path) + ".npy"
+    if not os.path.exists(path):
+        raise FileExistsError(f"{path} does not exist. Please fit PCA.")
+    X = np.load(path)
 
     print("Running MSDE on data.")
     _, X_total_dist, X_feature_dist  = msde.fit(X)
 
-    save_path = "data/" + cfg.pca.save_file + ".hdf5"
-    with h5py.File(save_path, 'a') as f:
+    path = str(cfg.path)
+    with h5py.File(path, 'a') as f:
         for key in ["total_dist", "feature_dist", "trajectory"]:
             if key in f:
                 del f[key]

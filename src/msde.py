@@ -10,7 +10,7 @@ from scipy.special import expit
 from numba import njit, prange
 from pynndescent import NNDescent
 from tqdm import tqdm
-import h5py
+import os
 
 
 def count_points_within_radius(X, tree, epsilon):
@@ -167,20 +167,19 @@ def shift_data(X, indices, weights, learning_rate):
 
 def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate,
                    max_iters_shift, shift_threshold, batch_size, path):
-    with h5py.File("data/"+path+".hdf5", 'r') as f:
-        if "weights" in f:
-            print("Loading saved weights.")
-            weights = np.array(f["weights"])
-        else:
-            weights = get_empirical_weights(
-                X,
-                nbd_sample_count_threshold=nbd_sample_count_threshold,
-                max_iters_weight_count=4,
-                satisfiability_proportion=0.3,
-                batch_size=batch_size
-            )
-            f["weights"] = weights
-            print("Saved weights to avoid computation in future.")
+    if os.path.exists(path):
+        print("Loading saved weights.")
+        weights = np.load(path)
+    else:
+        weights = get_empirical_weights(
+            X,
+            nbd_sample_count_threshold=nbd_sample_count_threshold,
+            max_iters_weight_count=4,
+            satisfiability_proportion=0.3,
+            batch_size=batch_size,
+        )
+        np.save(path, weights)
+        print("Saved weights to avoid computation in future.")
 
     shifted_dataset  = X.copy()
     total_distance   = np.zeros(X.shape[0])
