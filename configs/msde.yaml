@@ -1,4 +1,4 @@
-data: hcla
+data: hlca
 path: data/${data}_${pca.n_components}pc_${msde.k}k.hdf5
 
 pca:
