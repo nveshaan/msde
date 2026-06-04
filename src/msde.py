@@ -185,7 +185,7 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate, nn,
     shifted_dataset  = X.copy()
     total_distance   = np.zeros(X.shape[0])
     feature_distance = np.zeros(X.shape[1])
-    np.save(f"temp/traj_0.npy", shifted_dataset)
+    # np.save(f"temp/traj_0.npy", shifted_dataset)
 
     pbar = tqdm(range(max_iters_shift), desc="MSDE")
     for i in pbar:
@@ -216,7 +216,7 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate, nn,
         total_distance += total_change
         feature_distance += feature_change
         shifted_dataset = revised_d
-        np.save(f"temp/traj_{i+1}.npy", shifted_dataset)
+        # np.save(f"temp/traj_{i+1}.npy", shifted_dataset)
 
         if total_change.mean() < shift_threshold:
             pbar.total = i+1
