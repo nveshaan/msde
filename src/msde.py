@@ -168,7 +168,7 @@ def shift_data(X, indices, weights, learning_rate):
 
 def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate, nn,
                    max_iters_shift, shift_threshold, batch_size, path):
-    if os.path.exists(path):
+    if path is not None and os.path.exists(path):
         print("Loading saved weights.")
         weights = np.load(path)
     else:
@@ -179,13 +179,14 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate, nn,
             satisfiability_proportion=0.3,
             batch_size=batch_size,
         )
-        np.save(path, weights)
-        print("Saved weights to avoid computation in future.")
+        if path is not None:
+            np.save(path, weights)
+            print("Saved weights to avoid computation in future.")
 
     shifted_dataset  = X.copy()
     total_distance   = np.zeros(X.shape[0])
     feature_distance = np.zeros(X.shape[1])
-    # np.save(f"temp/traj_0.npy", shifted_dataset)
+    trajectory = [shifted_dataset.copy()]
 
     pbar = tqdm(range(max_iters_shift), desc="MSDE")
     for i in pbar:
@@ -216,7 +217,7 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate, nn,
         total_distance += total_change
         feature_distance += feature_change
         shifted_dataset = revised_d
-        # np.save(f"temp/traj_{i+1}.npy", shifted_dataset)
+        trajectory.append(shifted_dataset.copy())
 
         if total_change.mean() < shift_threshold:
             pbar.total = i+1
@@ -225,7 +226,7 @@ def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate, nn,
             print(f"Total change converged after iteration {i+1}. Exiting the loop.")
             break
 
-    return shifted_dataset, total_distance, feature_distance
+    return shifted_dataset, total_distance, feature_distance, trajectory
 
 
 def mean_shift_density_enhancement(X, k=50, nbd_sample_count_threshold=70,
@@ -319,7 +320,7 @@ class MSDE:
         self.X_train_ref = np.asarray(X_train).copy()
 
         # Shift training normals and fit GDE on the shifted positions
-        X_shifted, X_total_dist, X_feature_dist = mean_shift_density_enhancement(
+        X_shifted, X_total_dist, X_feature_dist, trajectory = mean_shift_density_enhancement(
             self.X_train_ref,
             k=self.k,
             nbd_sample_count_threshold=self.nbd_sample_count_threshold,
@@ -332,7 +333,7 @@ class MSDE:
         )
         if self.anomalyScore == 'GDE':
             self._gde = _GDEScorer().fit(X_shifted)
-        return X_shifted, X_total_dist, X_feature_dist
+        return X_shifted, X_total_dist, X_feature_dist, trajectory
     
     # TODO: implement partial_fit
     def partial_fit(self):
@@ -351,7 +352,7 @@ class MSDE:
         X_all = np.vstack([self.X_train_ref, X])
         n_train = len(self.X_train_ref)
 
-        X_shifted_all, _, _ = mean_shift_density_enhancement(
+        X_shifted_all, _, _, _ = mean_shift_density_enhancement(
             X_all,
             k=self.k,
             nbd_sample_count_threshold=self.nbd_sample_count_threshold,
