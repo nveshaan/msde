@@ -20,3 +20,6 @@
 ## Notes
 1. Trajectory genes has to renamed and even CellFlow might need to renamed (there already exists a tool called CellFlow which uses flow matching to predict the perturbation of gene expression levels)
 2. Saptarshi sir told to see what will happen if we keep one cluster fixed (how would the data points around the cluster interact with it)
+
+---
+
