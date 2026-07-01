@@ -468,7 +468,7 @@ def mean_shift_manifold_learning(
     learning_rate=0.3,
     max_iters_shift=5,
     shift_threshold=0.0001,
-    return_weights=False,
+    weights=None,
     clipping=False,
     clip_mode=0,
     alpha=0.5,
@@ -511,19 +511,8 @@ def mean_shift_manifold_learning(
     total_distance : np.ndarray
     trajectory     : list of np.ndarray
     """
-    if not return_weights:
-        data_shifted, total_distance, trajectory = get_shift_fast(
-            X, k, nbd_sample_count_threshold,
-            learning_rate, max_iters_shift, shift_threshold,
-            return_weights=False,
-            clipping=clipping,
-            clip_mode=clip_mode,
-            alpha=alpha,
-        )
-        return data_shifted, total_distance, trajectory
-
-    else:
-        data_shifted, weights, total_distance, trajectory = get_shift_fast(
+    if weights is None:
+        data_shifted, new_weights, total_distance, trajectory = get_shift_fast(
             X, k, nbd_sample_count_threshold,
             learning_rate, max_iters_shift, shift_threshold,
             return_weights=True,
@@ -531,4 +520,16 @@ def mean_shift_manifold_learning(
             clip_mode=clip_mode,
             alpha=alpha,
         )
-        return data_shifted, weights, total_distance, trajectory
+        return data_shifted, new_weights, total_distance, trajectory
+
+    else:
+        data_shifted, total_distance, trajectory = get_shift_fast(
+            X, k, nbd_sample_count_threshold,
+            learning_rate, max_iters_shift, shift_threshold,
+            return_weights=False,
+            clipping=clipping,
+            clip_mode=clip_mode,
+            alpha=alpha,
+            weights=weights,
+        )
+        return data_shifted, total_distance, trajectory

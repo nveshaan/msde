@@ -2,7 +2,7 @@
 1. what does each part of msde/dmsl do?
 2. what can we infer in trajectories of anomalies (or loners) merging into a cluster (or majority)?
 3. is it assumed that cells undergoing differentiation to be in minorites and cells which are functional adults to be majorities for msde/dmsl to infer the trajectories?
-4. how are msde/dmsl trajectory genes different from the real trajectory genes? if vastly different, how useful are the fake trajectory genes, and if similar, how does msde/dmsl compare to other methods such as optimal transport and flow matching (which can also predict the perturbation effects of drugs or gene knockouts on gene expression levels)
+4. how are msde/dmsl trajectory genes different from the real trajectory genes? if vastly different, how useful are the fake trajectory genes, and if similar, how does msde/dmsl compare to other methods (pseudotime as well) such as optimal transport and flow matching (which can also predict the perturbation effects of drugs or gene knockouts on gene expression levels)
 5. trajectories on hvg space vs embedding space. is there any benefit?
 
 # Optimal Transport
@@ -23,3 +23,9 @@
 
 ---
 
+## Answers
+1. yes, all algorithms do need good intermediate cell data points for a good trajectory inference
+
+## Hypothesis
+1. msde/dmsl shifts the cell data points into an implausible state, disrupting the inference of trajectory genes. in this regard, trajectory genes produced by msde/dmsl are useless until unless defending msde/dmsl with theoretical arguments.
+2. fixing the entire dataset except one cell or a group of cells that we want to calculate trajectory genes. essentially allowing them to traverse the unchanged, original manifold. we need a starting and ending point. this has potential to uncover the real trajectory genes. and might also give us trajectories themselves.
