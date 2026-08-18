@@ -561,7 +561,7 @@ def mean_shift_density_enhancement(
     weight_chunk_size=2048,
 ):
     """
-    Density-Mode Shift Learning (DMSL) — main entry point, GPU (PyTorch).
+    Mean-Shift Density Enhancement (MSDE) — main entry point, GPU (PyTorch).
 
     Parameters
     ----------
