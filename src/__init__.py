@@ -1,2 +1,1 @@
 from .msde import mean_shift_density_enhancement
-from .dmsl import mean_shift_manifold_learning

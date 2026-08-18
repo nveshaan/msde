@@ -1,51 +1,349 @@
-# Source: https://github.com/D6nam853/medi-msde/blob/main/msde/msde.py
-
+import logging
 import numpy as np
-from scipy.spatial import cKDTree
-from umap.umap_ import fuzzy_simplicial_set, nearest_neighbors
-from scipy.sparse import csr_matrix
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-from scipy.special import expit
-from numba import njit, prange
-from pynndescent import NNDescent
-from tqdm import tqdm
-import os
-from annoy import AnnoyIndex
+import torch
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 
 
-def count_points_within_radius(X, tree, epsilon):
-    neighbors = tree.query_ball_tree(tree, epsilon)
-    counts = np.array([len(pts) - 1 for pts in neighbors])
+def _configure_logging(log_file):
+    """
+    Route all logging from this module to `log_file` only.
+    If log_file is None, logging is disabled entirely (no console output).
+    Safe to call repeatedly (e.g. on every top-level entry point call).
+    """
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+        h.close()
+
+    logger.propagate = False
+
+    if log_file:
+        handler = logging.FileHandler(log_file)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+        )
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.addHandler(logging.NullHandler())
+        logger.setLevel(logging.CRITICAL + 1)
+
+
+# ---------------------------------------------------------------------------
+# k-NN (brute-force, GPU, chunked over the query dimension)
+# ---------------------------------------------------------------------------
+
+def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096):
+    """
+    Exact brute-force k-NN on GPU via chunked cdist + topk.
+
+    Includes the point itself as its own nearest neighbour (distance 0),
+    matching the convention of pynndescent / umap.nearest_neighbors that
+    the original code relied on.
+
+    Assumes X is already a tensor on `device`; no-op copy if so.
+
+    Returns
+    -------
+    knn_indices : LongTensor (n, k) on device
+    knn_dists   : FloatTensor (n, k) on device
+    """
+    X = torch.as_tensor(X, dtype=torch.float32, device=device)
+    n = X.shape[0]
+
+    all_idx = torch.empty((n, k), dtype=torch.long, device=device)
+    all_dist = torch.empty((n, k), dtype=torch.float32, device=device)
+
+    for start in range(0, n, chunk_size):
+        end = min(n, start + chunk_size)
+        d = torch.cdist(X[start:end], X)          # (chunk, n)
+        dists, idx = d.topk(k, largest=False, dim=1)
+        all_idx[start:end] = idx
+        all_dist[start:end] = dists
+
+    return all_idx, all_dist
+
+
+def compute_fixed_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096):
+    """
+    Compute fixed k-NN indices directly in feature space.
+    Drop-in GPU replacement for the original NNDescent-based version.
+    Returns a torch.LongTensor (kept on `device`) so it can be reused
+    across shift iterations without host<->device round trips.
+    """
+    indices, _ = torch_knn(X, k, device=device, chunk_size=chunk_size)
+    return indices
+
+
+def compute_knn_dists(X, indices):
+    """
+    Compute pairwise distances from X to its fixed k-NN (by index).
+    X       : FloatTensor (n, d) on device
+    indices : LongTensor  (n, k) on same device
+    Returns : FloatTensor (n, k) on same device
+    """
+    diff = X.unsqueeze(1) - X[indices]     # (n, k, d)
+    return diff.norm(dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# Fuzzy simplicial set (UMAP graph), fully vectorized on GPU
+# ---------------------------------------------------------------------------
+
+def fuzzy_simplicial_set_torch(knn_indices, knn_dists, n, n_neighbors, n_epochs=200,
+                                device=DEFAULT_DEVICE):
+    """
+    GPU port of UMAP's smooth-knn-dist + membership-strength + fuzzy-union
+    construction. All N per-point binary searches for sigma run in lockstep,
+    using boolean masks to freeze converged points instead of branching.
+    """
+    k = n_neighbors
+    target = float(np.log2(k))
+
+    knn_dists_t = torch.as_tensor(knn_dists, dtype=torch.float32, device=device)
+    knn_indices_t = torch.as_tensor(knn_indices, dtype=torch.long, device=device)
+
+    # Rho: distance to nearest non-zero neighbor
+    mask = knn_dists_t > 0
+    rhos = torch.where(mask, knn_dists_t, torch.tensor(float("inf"), device=device))
+    rhos = torch.clamp(rhos.min(dim=1).values, min=1e-8)
+
+    # Binary search for sigma, vectorized over all N points
+    lo = torch.full((n,), 1e-20, device=device)
+    hi = torch.full((n,), 1e3, device=device)
+    sigma = torch.ones(n, device=device)
+    dists_shifted = torch.clamp(knn_dists_t - rhos[:, None], min=0.0)
+    dists_shifted_tail = dists_shifted[:, 1:]  # skip j=0 (rho contributor)
+
+    for _ in range(64):
+        vals = torch.exp(-dists_shifted_tail / sigma[:, None])
+        vals_sum = vals.sum(dim=1)
+
+        converged = (vals_sum - target).abs() < 1e-5
+        too_high = (vals_sum > target) & ~converged
+        too_low = (vals_sum < target) & ~converged
+
+        hi = torch.where(too_high, sigma, hi)
+        lo = torch.where(too_low, sigma, lo)
+        sigma = torch.where(too_high, (lo + sigma) / 2.0, sigma)
+        sigma = torch.where(
+            too_low,
+            torch.where(hi >= 1e3, sigma * 2.0, (sigma + hi) / 2.0),
+            sigma,
+        )
+
+        if bool(converged.all()):
+            break
+
+    # Edge weights
+    weights = torch.exp(-dists_shifted / torch.clamp(sigma[:, None], min=1e-10))
+
+    rows = torch.arange(n, device=device).repeat_interleave(k)
+    cols = knn_indices_t.reshape(-1)
+    vals = weights.reshape(-1)
+
+    # Symmetrize on GPU: P = A + A^T - A * A^T
+    fwd_keys = rows * n + cols
+    rev_keys = cols * n + rows
+
+    sort_idx = torch.argsort(fwd_keys)
+    sorted_keys = fwd_keys[sort_idx]
+    sorted_vals = vals[sort_idx]
+
+    pos = torch.searchsorted(sorted_keys, rev_keys)
+    pos = torch.clamp(pos, max=sorted_keys.shape[0] - 1)
+    matched = sorted_keys[pos] == rev_keys
+    w_rev = torch.where(matched, sorted_vals[pos], torch.zeros_like(vals))
+
+    w_sym = vals + w_rev - vals * w_rev
+
+    threshold = w_sym.max() / max(n_epochs, 1)
+    active = torch.nonzero(w_sym >= threshold, as_tuple=True)[0]
+
+    return rows[active], cols[active], w_sym[active]
+
+
+# ---------------------------------------------------------------------------
+# Empirical weight computation
+#
+# The algorithm runs on the *entire* dataset as a single logical batch --
+# every point is compared against every other point, exactly like an
+# unbounded-memory O(n^2) implementation would. What's bounded is memory,
+# not the input: the similarity graph is stored sparse (only the ~n*k
+# nonzero edges, not a dense n x n matrix), and the O(n^2) pairwise-distance
+# work needed for the eps radius search is streamed in row-chunks (a la
+# `torch_knn`'s cdist chunking) so peak memory is O(chunk_size * n) instead
+# of O(n^2). The binary search for eps is inherently sequential (each step's
+# bounds depend on the previous step's result), so it stays a scalar
+# Python-level loop -- but each step's condition check is itself chunked.
+# ---------------------------------------------------------------------------
+
+def _build_sparse_similarity(X, n_neighbors, n_epochs, device):
+    """Fuzzy simplicial set stored as a sparse (n, n) COO tensor (~n*k
+    nonzeros) instead of a dense matrix."""
+    n = X.shape[0]
+    knn_idx, knn_dist = torch_knn(X, n_neighbors, device=device)
+    rows, cols, vals = fuzzy_simplicial_set_torch(
+        knn_idx, knn_dist, n, n_neighbors, n_epochs, device
+    )
+    return torch.sparse_coo_tensor(
+        torch.stack([rows, cols]), vals, size=(n, n), device=device,
+        check_invariants=False,  # rows/cols are valid knn indices by construction
+    ).coalesce()
+
+
+def _sparse_similarity_layout(S):
+    """
+    Precompute a CSR-like layout (sorted rows/cols/vals + row offset
+    pointers) once, so every chunked pass below can slice an arbitrary
+    row-range via plain Python indexing (`row_ptr[start:end]`) instead of
+    re-running `torch.searchsorted` (and a GPU sync) on every chunk.
+    """
+    idx = S.indices()
+    rows_sorted, cols_sorted, vals_sorted = idx[0], idx[1], S.values()
+    n = S.shape[0]
+    row_ptr = torch.searchsorted(
+        rows_sorted, torch.arange(0, n + 1, device=S.device)
+    ).tolist()  # one sync, not one per chunk
+    row_norm_sq = torch.zeros(n, dtype=torch.float32, device=S.device)
+    row_norm_sq.scatter_add_(0, rows_sorted, vals_sorted ** 2)
+    return rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq
+
+
+def _chunk_pairwise_dist(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, start, end):
+    """
+    Distances from every point (n) to the points in row-range [start, end),
+    computed without ever materializing a dense (n, n) matrix:
+    dense-ify just this row chunk from the sparse graph, get dot products
+    against all n rows via one sparse @ dense matmul, then finish with
+    ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>.
+    Returns dist (n, chunk) and idx (chunk,) -- the absolute row indices.
+    """
+    n = S.shape[0]
+    device = S.device
+    lo, hi = row_ptr[start], row_ptr[end]
+    c = end - start
+
+    chunk_dense = torch.zeros((c, n), dtype=row_norm_sq.dtype, device=device)
+    chunk_dense[rows_sorted[lo:hi] - start, cols_sorted[lo:hi]] = vals_sorted[lo:hi]
+
+    cross = torch.sparse.mm(S, chunk_dense.T)                       # (n, c)
+    idx = torch.arange(start, end, device=device)
+    sq_dist = row_norm_sq[:, None] + row_norm_sq[idx][None, :] - 2.0 * cross
+    dist = torch.sqrt(torch.clamp(sq_dist, min=0.0))                # (n, c)
+    return dist, idx
+
+
+def radius_counts_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
+                           eps, chunk_size):
+    """
+    Count neighbours within radius `eps` for every point. Every point is
+    still compared against every other point (same result as a full
+    O(n^2) computation); only the peak memory is bounded, to
+    O(chunk_size * n), by streaming over row-chunks.
+    """
+    n = S.shape[0]
+    counts = torch.zeros(n, dtype=torch.float32, device=S.device)
+    for start in range(0, n, chunk_size):
+        end = min(n, start + chunk_size)
+        dist, _ = _chunk_pairwise_dist(
+            S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, start, end
+        )
+        counts[start:end] = (dist < eps).sum(dim=0).float() - 1.0  # exclude self
     return counts
 
 
-def max_min_distances_kdtree(X):
-    tree = cKDTree(X)
-    dists, _ = tree.query(X, k=X.shape[0])
-    all_distances = dists[:, 1:].flatten()
-    return np.max(all_distances), np.min(all_distances)
+def _min_max_dist_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, chunk_size):
+    """Global max/min pairwise distance (excluding self-pairs), streamed
+    over row-chunks -- seeds the binary search bounds."""
+    n = S.shape[0]
+    device = S.device
+    running_max = torch.tensor(float("-inf"), device=device)
+    running_min = torch.tensor(float("inf"), device=device)
+    for start in range(0, n, chunk_size):
+        end = min(n, start + chunk_size)
+        dist, idx = _chunk_pairwise_dist(
+            S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, start, end
+        )
+        self_mask = torch.zeros_like(dist, dtype=torch.bool)
+        self_mask[idx, torch.arange(idx.shape[0], device=device)] = True
+        running_max = torch.maximum(running_max, dist.masked_fill(self_mask, float("-inf")).max())
+        running_min = torch.minimum(running_min, dist.masked_fill(self_mask, float("inf")).min())
+    return running_max.item(), running_min.item()
 
 
-def binary_search_condition(low, high, condition, tol=1e-4, max_iter=50):
-    result = None
+def _binary_search_eps_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
+                                low, high, threshold, required, chunk_size, tol=1e-4, max_iter=50):
+    """
+    Scalar binary search for the smallest eps satisfying the density
+    condition -- inherently sequential (each step's bounds depend on the
+    previous step), same as the original. Each condition check runs
+    chunked, so the search stays within a fixed memory budget regardless
+    of n, and gives the exact same eps a full O(n^2) search would.
+    """
+    lo, hi = low, high
+    result = high
+    found = False
     for _ in range(max_iter):
-        mid = (low + high) / 2
-        if condition(mid):
-            result = mid
-            high = mid
+        mid = (lo + hi) / 2.0
+        counts = radius_counts_chunked(
+            S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, mid, chunk_size
+        )
+        satisfied = int((counts > threshold).sum().item())  # one sync per iteration
+        if satisfied >= required:
+            result, found, hi = mid, True, mid
         else:
-            low = mid
-        if abs(high - low) < tol:
+            lo = mid
+        if abs(hi - lo) < tol:
             break
-    return result
+    return result, found
 
 
-def condition_formulation(point_in_radius_counts, nbd_sample_count_threshold,
-                          satisfiability_proportion):
-    if_satisfied = (np.where(
-        point_in_radius_counts > nbd_sample_count_threshold)[0]) * 1
-    return np.sum(if_satisfied) >= satisfiability_proportion
+def compute_weights_from_similarity_chunked(S, n, nbd_sample_count_threshold,
+                                             satisfiability_proportion, max_iters_weight_count,
+                                             chunk_size):
+    """
+    Chunked (memory-bounded, exact) replacement for the original dense
+    per-batch weight computation. Operates on the entire similarity graph
+    `S` as a single logical batch.
+    """
+    rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq = _sparse_similarity_layout(S)
+
+    max_dist, min_dist = _min_max_dist_chunked(
+        S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, chunk_size
+    )
+
+    threshold = max(1, n - 1) if nbd_sample_count_threshold >= n else nbd_sample_count_threshold
+    required = int(satisfiability_proportion * n)
+
+    eps, found = _binary_search_eps_chunked(
+        S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
+        min_dist, max_dist, threshold, required, chunk_size,
+    )
+
+    if not found:
+        relaxed_thresh = max(1, threshold // 2)
+        relaxed_required = required // 2
+        eps, found = _binary_search_eps_chunked(
+            S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
+            min_dist, max_dist, relaxed_thresh, relaxed_required, chunk_size,
+        )
+
+    if not found:
+        eps = max_dist
+
+    delta = (eps - 1e-6) / max_iters_weight_count
+    total_counts = torch.zeros(n, dtype=torch.float32, device=S.device)
+    eps_running = eps
+    for _ in range(max_iters_weight_count):
+        total_counts += radius_counts_chunked(
+            S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, eps_running, chunk_size
+        )
+        eps_running -= delta
+
+    return total_counts / max_iters_weight_count
 
 
 def get_empirical_weights(
@@ -54,319 +352,256 @@ def get_empirical_weights(
     max_iters_weight_count=4,
     satisfiability_proportion=0.3,
     n_neighbors=15,
-    metric='euclidean',
-    random_state=42,
-    batch_size=1000
+    random_state=42,   # kept for signature compatibility; unused (exact GPU knn)
+    n_epochs=200,
+    device=DEFAULT_DEVICE,
+    chunk_size=2048,
 ):
-    def umap_graph_similarity(X_batch):
-        knn_indices, knn_dists, _ = nearest_neighbors(
-            X_batch, n_neighbors=n_neighbors, metric=metric,
-            metric_kwds={}, angular=False, random_state=random_state,
-            low_memory=True, use_pynndescent=True
-        )
-        G, _, _ = fuzzy_simplicial_set(
-            X_batch, n_neighbors=n_neighbors, random_state=random_state,
-            metric=metric, knn_indices=knn_indices, knn_dists=knn_dists,
-            angular=False, set_op_mix_ratio=1.0, local_connectivity=1.0,
-            apply_set_operations=True, verbose=False
-        )
-        return G.toarray() if isinstance(G, csr_matrix) else G
+    """
+    Compute empirical density weights for each point over the *full*
+    dataset as a single batch -- no data is split or approximated.
 
-    def compute_weights_from_similarity(sim, X_batch):
-        tree = cKDTree(sim)
-        max_dist, min_dist = max_min_distances_kdtree(sim)
-        threshold = (
-            max(1, len(X_batch) - 1)
-            if nbd_sample_count_threshold >= len(X_batch)
-            else nbd_sample_count_threshold
-        )
-        effective_required = int(satisfiability_proportion * len(X_batch))
+    Memory is bounded by chunking the O(n^2) distance computation itself
+    (sparse similarity graph + row-chunked distances), not by chunking
+    the input, so results are identical to an unbounded-memory run. Lower
+    `chunk_size` trades speed for a smaller peak-memory footprint.
 
-        eps = binary_search_condition(
-            min_dist, max_dist,
-            lambda mid: condition_formulation(
-                count_points_within_radius(sim, tree, mid),
-                threshold, effective_required
-            )
-        )
-        if eps is None:
-            eps = binary_search_condition(
-                min_dist, max_dist,
-                lambda mid: condition_formulation(
-                    count_points_within_radius(sim, tree, mid),
-                    max(1, threshold // 2), effective_required // 2
-                )
-            )
-        if eps is None:
-            eps = max_dist
+    Returns a FloatTensor (n,) on `device` -- kept as a tensor (not numpy)
+    so callers can chain it into further GPU work without a round trip.
+    """
+    X = torch.as_tensor(X, dtype=torch.float32, device=device)
+    n = X.shape[0]
 
-        delta = (eps - 1e-6) / max_iters_weight_count
-        all_counts = []
-        for _ in range(max_iters_weight_count):
-            counts = count_points_within_radius(sim, tree, eps)
-            all_counts.append(counts)
-            eps -= delta
-        return np.mean(all_counts, axis=0)
+    S = _build_sparse_similarity(X, n_neighbors, n_epochs, device)
 
-    if len(X) <= 3 * n_neighbors:
-        sim = umap_graph_similarity(X)
-        return compute_weights_from_similarity(sim, X)
-
-    effective_batch_size = min(batch_size, max(n_neighbors * 3, 100))
-    total_batches = (len(X) + effective_batch_size - 1) // effective_batch_size
-    weights_all = []
-    for batch_idx in tqdm(range(total_batches), desc="Calculating Emperical Weights"):
-        start = batch_idx * effective_batch_size
-        end   = min(len(X), start + effective_batch_size)
-        X_batch = X[start:end]
-        sim = umap_graph_similarity(X_batch)
-        weights_all.append(compute_weights_from_similarity(sim, X_batch))
-    return np.concatenate(weights_all)
-
-
-# TODO: consider vectorizing the loops
-@njit(fastmath=True, parallel=True)
-def shift_data(X, indices, weights, learning_rate):
-    n, k = indices.shape
-    d = X.shape[1]
-    revised_d = np.empty_like(X)
-    total_change = np.empty(n)
-
-    for i in prange(n):
-        denom = 0.0
-        for j in range(k):
-            denom += weights[indices[i, j]]
-        if denom < 1e-6:
-            denom = 1e-6
-
-        for t in range(d):
-            acc = 0.0
-            for j in range(k):
-                acc += weights[indices[i, j]] * X[indices[i, j], t]
-            acc /= denom
-            revised_d[i, t] = acc
-
-        dist = 0.0
-        for t in range(d):
-            diff = revised_d[i, t] - X[i, t]
-            dist += diff * diff
-        dist = np.sqrt(dist)
-        total_change[i] = dist
-
-        if dist > 1e-6:
-            scale = learning_rate * dist
-            for t in range(d):
-                revised_d[i, t] = (X[i, t]
-                                   + scale * (revised_d[i, t] - X[i, t]) / dist) # BUG: add 1e-6 for numerical stability?
-        else:
-            for t in range(d):
-                revised_d[i, t] = X[i, t]
-
-    # BUG: total_change is inconsistent with the papers. is it intended change or is it applied change?
-    return revised_d, total_change
-
-
-def get_shift_fast(X, k, nbd_sample_count_threshold, learning_rate, nn,
-                   max_iters_shift, shift_threshold, batch_size, path):
-    if path is not None and os.path.exists(path):
-        print("Loading saved weights.")
-        weights = np.load(path)
-    else:
-        weights = get_empirical_weights(
-            X,
-            nbd_sample_count_threshold=nbd_sample_count_threshold,
-            max_iters_weight_count=4,
-            satisfiability_proportion=0.3,
-            batch_size=batch_size,
-        )
-        if path is not None:
-            np.save(path, weights)
-            print("Saved weights to avoid computation in future.")
-
-    shifted_dataset  = X.copy()
-    total_distance   = np.zeros(X.shape[0])
-    feature_distance = np.zeros(X.shape[1])
-    trajectory = [shifted_dataset.copy()]
-
-    pbar = tqdm(range(max_iters_shift), desc="MSDE")
-    for i in pbar:
-        if nn=="nndescent":
-            index = NNDescent(
-                shifted_dataset, n_neighbors=k, n_jobs=-1,
-                metric="euclidean", random_state=42
-            )
-            indices, _ = index.neighbor_graph
-        elif nn=="annoy":
-            # n_trees, search_k are the two main params to tune Annoy.
-            d = shifted_dataset.shape[1]
-            annoy_index = AnnoyIndex(d, 'euclidean')
-            for idx in range(shifted_dataset.shape[0]):
-                annoy_index.add_item(idx, shifted_dataset[idx])
-                
-            annoy_index.build(n_trees=50, n_jobs=-1) 
-            indices = np.empty((shifted_dataset.shape[0], k), dtype=np.int64)
-            for idx in range(shifted_dataset.shape[0]):
-                indices[idx] = annoy_index.get_nns_by_item(idx, k, search_k=-1)
-
-        indices = indices.astype(np.int64)
-
-        revised_d, total_change = shift_data(
-            shifted_dataset, indices, weights, learning_rate
-        )
-        feature_change = np.sum(np.abs(revised_d - shifted_dataset), axis=0)
-        total_distance += total_change
-        feature_distance += feature_change
-        shifted_dataset = revised_d
-        trajectory.append(shifted_dataset.copy())
-
-        if total_change.mean() < shift_threshold:
-            pbar.total = i+1
-            pbar.refresh()
-            pbar.close()
-            print(f"Total change converged after iteration {i+1}. Exiting the loop.")
-            break
-
-    return shifted_dataset, total_distance, feature_distance, trajectory
-
-
-def mean_shift_density_enhancement(X, k=50, nbd_sample_count_threshold=70,
-                                 learning_rate=0.33, max_iters_shift=8,
-                                 shift_threshold=0.01, batch_size=1000,
-                                 path=None, nn="nndescent"):
-    return get_shift_fast(
-        X, k, nbd_sample_count_threshold, learning_rate, nn,
-        max_iters_shift, shift_threshold, batch_size, path,
+    return compute_weights_from_similarity_chunked(
+        S, n, nbd_sample_count_threshold, satisfiability_proportion,
+        max_iters_weight_count, chunk_size,
     )
 
 
-class _GDEScorer:
+# ---------------------------------------------------------------------------
+# Core shift kernel — density-weighted barycenter shift, fully vectorized on GPU
+# ---------------------------------------------------------------------------
+
+def shift_data(
+    X,
+    indices,
+    dists,
+    base_weights,
+    learning_rate,
+    clipping=False,
+    clip_mode=0,       # 0 = no clipping, 1 = soft, 2 = hard
+    alpha=0.5,
+):
     """
-    Gaussian Density Estimator on PCA-256 projected shifted features.
-    Anomaly score = Mahalanobis distance from the normal cluster.
-    Higher score → more anomalous.
+    One DMSL shift step: move each point toward the barycenter of its k
+    fixed neighbours, weighted only by each neighbour's base (empirical
+    density) weight — no distance-based (t-kernel) term. Vectorized
+    PyTorch version — no Python-level loop over samples.
+
+    Parameters
+    ----------
+    X             : FloatTensor (n, d)      on device
+    indices       : LongTensor  (n, k)      on device
+    dists         : FloatTensor (n, k)      on device (used only for
+                                             clipping's median-distance cap)
+    base_weights  : FloatTensor (n,)        on device
+    learning_rate : float
+    clipping      : bool
+    clip_mode     : int   0=none, 1=soft, 2=hard
+    alpha         : float
+
+    Returns
+    -------
+    revised_d : FloatTensor (n, d) on device
+    change    : FloatTensor (n,)   on device
     """
+    n, k = indices.shape
 
-    GDE_PCA_DIM = 256
-    REG         = 1e-4
+    # --- weighted barycenter ---
+    w = base_weights[indices]                                   # (n, k)
+    denom = w.sum(dim=1, keepdim=True).clamp_min(1e-6)          # (n, 1)
 
-    def __init__(self):
-        self._pca     = None
-        self._mean    = None
-        self._cov_inv = None
+    neighbor_pos = X[indices]                                   # (n, k, d)
+    revised_d = (w.unsqueeze(-1) * neighbor_pos).sum(dim=1) / denom   # (n, d)
 
-    def fit(self, X_shifted_train: np.ndarray):
-        X = X_shifted_train.copy()
+    # --- movement magnitude ---
+    diff = revised_d - X
+    dist_move = diff.norm(dim=1)                                # (n,)
+    change = dist_move.clone()
 
-        dim = min(self.GDE_PCA_DIM, X.shape[1], X.shape[0] - 1)
-        self._pca = PCA(n_components=dim, random_state=42)
-        X = self._pca.fit_transform(X)
+    moved = dist_move >= 1e-8   # points that actually move
 
-        self._mean = X.mean(axis=0)
-        X_c = X - self._mean
-        cov = (X_c.T @ X_c) / max(len(X) - 1, 1)
-        cov += np.eye(dim) * self.REG
-        self._cov_inv = np.linalg.inv(cov)
-        return self
+    if clipping and clip_mode > 0:
+        median_dist = dists.sort(dim=1).values[:, k // 2]        # (n,) matches tmp[k//2]
+        delta = (alpha * median_dist).clamp_min(1e-8)
 
-    def score(self, X_shifted_test: np.ndarray) -> np.ndarray:
-        X    = self._pca.transform(X_shifted_test.copy())
-        diff = X - self._mean
-        maha2 = np.einsum('ij,jk,ik->i', diff, self._cov_inv, diff)
-        return np.sqrt(np.clip(maha2, 0, None))
+        if clip_mode == 1:
+            effective_step = dist_move * (delta / (delta + dist_move))
+        else:
+            effective_step = torch.minimum(dist_move, delta)
+    else:
+        effective_step = dist_move
+
+    dist_move_safe = dist_move.clamp_min(1e-12)  # avoid /0 for unmoved points
+    scale = (learning_rate * effective_step / dist_move_safe).unsqueeze(-1)  # (n, 1)
+
+    updated = X + scale * diff
+    revised_d = torch.where(moved.unsqueeze(-1), updated, X)
+    change = torch.where(moved, change, torch.zeros_like(change))
+
+    return revised_d, change
 
 
-class MSDE:
+# ---------------------------------------------------------------------------
+# Core shift loop
+# ---------------------------------------------------------------------------
+
+def get_shift_fast(
+    X,
+    k,
+    nbd_sample_count_threshold,
+    learning_rate,
+    max_iters_shift,
+    shift_threshold,
+    clipping=False,
+    clip_mode=0,
+    alpha=0.5,
+    device=DEFAULT_DEVICE,
+    keep_trajectory=False,
+    log_file=None,
+    weight_chunk_size=2048,
+):
     """
-    Manifold-Shift Manifold Learning anomaly detector.
+    Run the DMSL shift loop on GPU.
 
-    Scoring is fixed to GDE (Mahalanobis distance in PCA-256 shifted space).
-    Only the five shift hyperparameters need to be tuned.
+    k-NN indices are computed once via brute-force GPU k-NN and reused
+    across all iterations (only `dists` and positions change per step).
+    Everything stays as a device tensor end-to-end; the only host<->device
+    transfers are the required input upload and the final output download
+    (plus optional per-iteration trajectory snapshots, opt-in only).
+
+    weight_chunk_size : int — row-chunk size used by the empirical-weight
+                              eps search (memory/speed knob only; does not
+                              change the result). Lower it if you hit an
+                              out-of-memory error on `get_empirical_weights`.
     """
+    _configure_logging(log_file)
 
-    # TODO: add cumulative displacement anamoly scoring
-    def __init__(
-        self,
-        seed: int,
-        model_name: str = 'MSDE',
-        k: int = 50,
-        nbd_sample_count_threshold: int = 70,
-        learning_rate: float = 0.33,
-        max_iters_shift: int = 8,
-        shift_threshold: float = 0.01,
-        anomalyThreshold: float = 0.22,
-        scaler=None,
-        anomalyScore = 'GDE',
-        batch_size: int = 1000,
-        path: str = None,
-        nn: str = "nndescent",
-    ):
-        self.k                          = k
-        self.nbd_sample_count_threshold = nbd_sample_count_threshold
-        self.learning_rate              = learning_rate
-        self.max_iters_shift            = max_iters_shift
-        self.shift_threshold            = shift_threshold
-        self.anomalyThreshold           = anomalyThreshold
-        self.scaler                     = scaler or StandardScaler()
-        self.seed                       = seed
-        self.model_name                 = model_name
-        self.X_train_ref                = None
-        self._gde                       = None
-        self.anomalyScore               = anomalyScore
-        self.batch_size                 = batch_size
-        self.path                       = path
-        self.nn                         = nn
+    X_t = torch.as_tensor(X, dtype=torch.float32, device=device)
 
-    def fit(self, X_train, y_train=None):
-        self.X_train_ref = np.asarray(X_train).copy()
+    base_weights_t = get_empirical_weights(
+        X_t,
+        nbd_sample_count_threshold=nbd_sample_count_threshold,
+        max_iters_weight_count=4,
+        satisfiability_proportion=0.3,
+        chunk_size=weight_chunk_size,
+        device=device,
+    )
 
-        # Shift training normals and fit GDE on the shifted positions
-        X_shifted, X_total_dist, X_feature_dist, trajectory = mean_shift_density_enhancement(
-            self.X_train_ref,
-            k=self.k,
-            nbd_sample_count_threshold=self.nbd_sample_count_threshold,
-            learning_rate=self.learning_rate,
-            max_iters_shift=self.max_iters_shift,
-            shift_threshold=self.shift_threshold,
-            batch_size=self.batch_size,
-            path=self.path,
-            nn=self.nn,
-        )
-        if self.anomalyScore == 'GDE':
-            self._gde = _GDEScorer().fit(X_shifted)
-        return X_shifted, X_total_dist, X_feature_dist, trajectory
-    
-    # TODO: implement partial_fit
-    def partial_fit(self):
-        raise NotImplementedError
+    n_samples = X_t.shape[0]
+    shifted_dataset = X_t.clone()
+    total_distance = torch.zeros(n_samples, device=device)
+    trajectory = [shifted_dataset.clone().cpu().numpy()] if keep_trajectory else []
 
-    def predict_score(self, X):
-        X = np.asarray(X)
+    logger.info(f"Computing fixed k-NN (k={k}) in feature space on {device} ...")
+    indices_fixed = compute_fixed_knn(X_t, k, device=device)
 
-        if self.X_train_ref is None:
-            raise ValueError("Model not fitted. Call fit(X_train) first.")
-        
-        if self._gde is None:
-            raise ValueError("GDE scorer not fitted. Pass 'GDE' to anomalyScore.")
+    with torch.no_grad():
+        for iter_count in range(max_iters_shift):
+            dists = compute_knn_dists(shifted_dataset, indices_fixed)
 
-        # Shift train + test together to preserve neighbourhood context
-        X_all = np.vstack([self.X_train_ref, X])
-        n_train = len(self.X_train_ref)
+            revised_d, change = shift_data(
+                shifted_dataset,
+                indices_fixed,
+                dists,
+                base_weights_t,
+                learning_rate,
+                clipping,
+                clip_mode,
+                alpha,
+            )
 
-        X_shifted_all, _, _, _ = mean_shift_density_enhancement(
-            X_all,
-            k=self.k,
-            nbd_sample_count_threshold=self.nbd_sample_count_threshold,
-            learning_rate=self.learning_rate,
-            max_iters_shift=self.max_iters_shift,
-            shift_threshold=self.shift_threshold,
-            batch_size=self.batch_size,
-            path=self.path,
-            nn=self.nn,
-        )
+            total_distance += change
+            shifted_dataset = revised_d
+            if keep_trajectory:
+                trajectory.append(shifted_dataset.clone().cpu().numpy())
 
-        # Score test points via GDE fitted on training normals
-        X_shifted_test = X_shifted_all[n_train:]
-        gde_scores     = self._gde.score(X_shifted_test)
+            mean_change = change.mean().item()   # single sync point per iter
+            logger.debug(f"Iter {iter_count + 1}: mean change = {mean_change:.6f}")
 
-        scores = self.scaler.fit_transform(gde_scores.reshape(-1, 1))
-        return expit(scores).squeeze()
+            if mean_change < shift_threshold:
+                logger.info(f"Converged at iteration {iter_count + 1}.")
+                break
+
+    shifted_dataset_np = shifted_dataset.cpu().numpy()
+    total_distance_np = total_distance.cpu().numpy()
+
+    return shifted_dataset_np, total_distance_np, trajectory
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def mean_shift_density_enhancement(
+    X,
+    k=30,
+    nbd_sample_count_threshold=30,
+    learning_rate=0.3,
+    max_iters_shift=5,
+    shift_threshold=0.0001,
+    clipping=False,
+    clip_mode=0,
+    alpha=0.5,
+    device=DEFAULT_DEVICE,
+    keep_trajectory=False,
+    log_file=None,
+    weight_chunk_size=2048,
+):
+    """
+    Density-Mode Shift Learning (DMSL) — main entry point, GPU (PyTorch).
+
+    Parameters
+    ----------
+    X : np.ndarray, shape (n_samples, n_features)
+    k : int
+    nbd_sample_count_threshold : int
+    learning_rate : float
+    max_iters_shift : int
+    shift_threshold : float
+    clipping  : bool  — enable per-step clipping; pass True for trajectory
+                        runs only, leave False for clustering runs
+    clip_mode : int   — 0=none, 1=soft (smooth saturation), 2=hard (strict cap)
+    alpha     : float — step cap = alpha * local_median_neighbour_dist
+    device    : str   — 'mps' or 'cuda' or 'cpu'
+    keep_trajectory : bool — if False, skips per-iteration device->host
+                              copies of the full dataset (faster, lower
+                              host memory, for runs that don't need it)
+    log_file  : str or None — path to write logs to; if None, logging is
+                              disabled entirely (nothing is logged anywhere)
+    weight_chunk_size : int — memory/speed knob for the empirical-weight
+                              eps search; lower it under tight VRAM. Does
+                              not change the computed weights, since every
+                              point is still compared against every other
+                              point regardless of chunk size.
+
+    Returns
+    -------
+    data_shifted   : np.ndarray
+    total_distance : np.ndarray
+    trajectory     : list of np.ndarray
+    """
+    data_shifted, total_distance, trajectory = get_shift_fast(
+        X, k, nbd_sample_count_threshold,
+        learning_rate, max_iters_shift, shift_threshold,
+        clipping=clipping,
+        clip_mode=clip_mode,
+        alpha=alpha,
+        device=device,
+        keep_trajectory=keep_trajectory,
+        log_file=log_file,
+        weight_chunk_size=weight_chunk_size,
+    )
+    return data_shifted, total_distance, trajectory
