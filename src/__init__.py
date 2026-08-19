@@ -1,1 +1,1 @@
-from .msde import mean_shift_density_enhancement
+from .msde import MeanShiftDensityEnhancement, mean_shift_density_enhancement
