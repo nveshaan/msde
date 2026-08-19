@@ -129,7 +129,7 @@ def fuzzy_simplicial_set_torch(knn_indices, knn_dists, n, n_neighbors, n_epochs=
     target = float(torch.log2(torch.tensor(k, dtype=torch.float32)))
 
     # Compute binary search targets (rho and sigma) WITHOUT tracking gradients
-    # so we don't build a massive, unstable autograd graph inside the loop.
+    # so we don't build a massive, unstable autograd greaph inside the loop.
     with torch.no_grad():
         mask = knn_dists > 0
         rhos_ng = torch.where(mask, knn_dists, torch.tensor(float("inf"), device=device))
@@ -338,9 +338,17 @@ def _binary_search_eps_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr
     return result, found
 
 
-def _calculate_eps_from_similarity(S, n, nbd_sample_count_threshold,
+def _calculate_eps_from_similarity(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
+                                   n, nbd_sample_count_threshold,
                                    satisfiability_proportion, chunk_size):
-    rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq = _sparse_similarity_layout(S)
+    """
+    Same computation as before, but now takes the sparse-similarity layout
+    (rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq) as input
+    instead of rebuilding it from S via _sparse_similarity_layout. Callers
+    that already have the layout (compute_weights_from_similarity_chunked,
+    MeanShiftDensityEnhancement.forward) no longer pay for a second
+    searchsorted + scatter_add pass over the whole graph just to get eps.
+    """
     max_dist, min_dist = _min_max_dist_chunked(
         S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, chunk_size
     )
@@ -371,18 +379,29 @@ def _calculate_eps_from_similarity(S, n, nbd_sample_count_threshold,
 
 def compute_weights_from_similarity_chunked(S, n, nbd_sample_count_threshold,
                                             satisfiability_proportion, max_iters_weight_count,
-                                            chunk_size, temperature=None, eps=None):
+                                            chunk_size, temperature=None, eps=None, layout=None):
     """
     Chunked (memory-bounded, exact) replacement for the original dense
     per-batch weight computation. Operates on the entire similarity graph
     `S` as a single logical batch.
+
+    `layout`, if given, is a precomputed
+    (rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq) tuple from
+    `_sparse_similarity_layout(S)`. Callers that already built the layout
+    (e.g. MeanShiftDensityEnhancement.forward, which needs it to compute eps
+    before calling this function) should pass it in here to avoid a second
+    searchsorted + scatter_add pass over the whole graph. When omitted, the
+    layout is built once, internally, exactly as before.
     """
-    rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq = _sparse_similarity_layout(S)
+    if layout is None:
+        layout = _sparse_similarity_layout(S)
+    rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq = layout
 
     if eps is None:
         with torch.no_grad():
             eps_tensor = _calculate_eps_from_similarity(
-                S, n, nbd_sample_count_threshold,
+                S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
+                n, nbd_sample_count_threshold,
                 satisfiability_proportion, chunk_size,
             )
     else:
@@ -523,24 +542,6 @@ def shift_data(
     fixed neighbours, weighted only by each neighbour's base (empirical
     density) weight — no distance-based (t-kernel) term. Vectorized
     PyTorch version — no Python-level loop over samples.
-
-    Parameters
-    ----------
-    X             : FloatTensor (n, d)      on device
-    indices       : LongTensor  (n, k)      on device
-    dists         : FloatTensor (n, k)      on device (used only for
-                                             clipping's median-distance cap)
-    base_weights  : FloatTensor (n,)        on device
-    learning_rate : float
-    clipping      : bool
-    clip_mode     : int   0=none, 1=soft, 2=hard
-    alpha         : float
-    gate          : scalar multiplier applied to the update step
-
-    Returns
-    -------
-    revised_d : FloatTensor (n, d) on device
-    change    : FloatTensor (n,)   on device
     """
     n, k = indices.shape
 
@@ -676,9 +677,14 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
 
         if self.learn_eps and self.eps is None:
             similarity = _build_sparse_similarity(X, 15, 200, self.device_name)
+            # Build the layout once and reuse it for both the eps calculation
+            # below and the chunked weight pass that follows, instead of each
+            # of those two steps independently rebuilding it from `similarity`.
+            layout = _sparse_similarity_layout(similarity)
             with torch.no_grad():
                 eps_initial = _calculate_eps_from_similarity(
                     similarity,
+                    *layout,
                     X.shape[0],
                     self.nbd_sample_count_threshold,
                     0.3,
@@ -698,6 +704,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                     self.weight_chunk_size,
                     self.temperature,
                     self.eps,
+                    layout=layout,
                 )
             else:
                 base_weights_t = compute_weights_from_similarity_dense(
