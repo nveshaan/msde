@@ -66,6 +66,34 @@ def _scheduled_gate(scheduler, step, total_steps, start, end, device, dtype):
 
 
 # ---------------------------------------------------------------------------
+# Sparse-op support probe (cached per device string)
+#
+# torch.sparse_coo_tensor / torch.sparse.mm historically raised
+# NotImplementedError on the MPS backend; support has landed on some
+# recent builds but isn't guaranteed for every torch/macOS combination.
+# Probe once per device, cache the result, and let callers fall back to
+# the dense gather-based path instead of hard-crashing.
+# ---------------------------------------------------------------------------
+
+_SPARSE_MM_SUPPORT_CACHE = {}
+
+
+def _sparse_mm_supported(device):
+    if device in _SPARSE_MM_SUPPORT_CACHE:
+        return _SPARSE_MM_SUPPORT_CACHE[device]
+    try:
+        idx = torch.zeros((2, 1), dtype=torch.long, device=device)
+        vals = torch.ones(1, device=device)
+        t = torch.sparse_coo_tensor(idx, vals, (1, 1), device=device).coalesce()
+        torch.sparse.mm(t, torch.ones(1, 1, device=device))
+        supported = True
+    except Exception:
+        supported = False
+    _SPARSE_MM_SUPPORT_CACHE[device] = supported
+    return supported
+
+
+# ---------------------------------------------------------------------------
 # k-NN (brute-force, GPU, chunked over the query dimension)
 # ---------------------------------------------------------------------------
 
@@ -505,80 +533,170 @@ def get_empirical_weights(
 
 
 # ---------------------------------------------------------------------------
-# Core shift kernel 
+# Core shift kernel
+#
+# Two structurally different kernels, selected once per model instance
+# (not per call):
+#
+#   sparse path : barycenter = torch.sparse.mm(W, X), where W is the
+#                 (n, n) row-normalized neighbour-weight matrix, built once
+#                 (indices_fixed + w_norm are loop-invariant across shift
+#                 iterations). No (n, k, d) gather every iteration.
+#   gather path : original X[indices] gather + weighted sum. Used when
+#                 sparse ops aren't supported on the target device (see
+#                 _sparse_mm_supported) or explicitly disabled.
+#
+# clipping / clip_mode / use_sparse / low_precision are captured as plain
+# Python closure constants, not passed as runtime tensor/scalar arguments,
+# so torch.compile traces one straight-line graph per config with no
+# runtime branch and no per-call guard/recompile risk.
 # ---------------------------------------------------------------------------
 
-@torch.compile(fullgraph=True)
-def shift_data(
-    X,
-    indices,
-    w,
-    denom,
-    learning_rate,
-    clipping=False,
-    clip_mode=0,       
-    alpha=0.5,
-    gate=1.0,
-):
+# ---------------------------------------------------------------------------
+# Core shift kernel
+#
+# Two structurally different kernels, selected once per model instance
+# (not per call):
+#
+#   sparse path : barycenter = torch.sparse.mm(W, X), where W is the
+#                 (n, n) row-normalized neighbour-weight matrix, built once
+#                 (indices_fixed + w_norm are loop-invariant across shift
+#                 iterations). No (n, k, d) gather every iteration.
+#   gather path : original X[indices] gather + weighted sum. Used when
+#                 sparse ops aren't supported on the target device (see
+#                 _sparse_mm_supported) or explicitly disabled.
+#
+# IMPORTANT: torch.compile cannot trace a function that takes a sparse
+# tensor as an argument at all ("Attempted to wrap sparse Tensor") --
+# this is a hard limitation, unrelated to whether the *eager* op runs fine
+# (which _sparse_mm_supported checks). So torch.sparse.mm is always called
+# eagerly, outside any compiled region; only the movement math that follows
+# (dense-only: diff, clipping, update) is compiled.
+#
+# clipping / clip_mode / low_precision are captured as plain Python closure
+# constants, not passed as runtime tensor/scalar arguments, so each
+# compiled kernel is one straight-line graph with no runtime branch and no
+# per-call guard/recompile risk.
+# ---------------------------------------------------------------------------
+
+def _build_sparse_weight_matrix(indices_i64, w_norm, n, device):
     """
-    One DMSL shift step: move each point toward the barycenter of its k
-    fixed neighbours, weighted only by each neighbour's base (empirical
-    density) weight — no distance-based (t-kernel) term. Vectorized
-    PyTorch version — no Python-level loop over samples.
-
-    Parameters
-    ----------
-    X             : FloatTensor (n, d)      on device
-    indices       : LongTensor  (n, k)      on device
-    dists         : FloatTensor (n, k)      on device (used only for
-                                             clipping's median-distance cap)
-    base_weights  : FloatTensor (n,)        on device
-    learning_rate : float
-    clipping      : bool
-    clip_mode     : int   0=none, 1=soft, 2=hard
-    alpha         : float
-    gate          : scalar multiplier applied to the update step
-
-    Returns
-    -------
-    revised_d : FloatTensor (n, d) on device
-    change    : FloatTensor (n,)   on device
+    (n, n) sparse COO weight matrix from a fixed (n, k) neighbour index
+    table and its row-normalized weights. Built once per forward() call
+    (indices_fixed and w_norm don't change across shift iterations), then
+    reused every iteration via torch.sparse.mm(W, X) in place of a fresh
+    gather. NOTE: sparse_coo_tensor indices must be int64 -- pass the
+    int64 copy of indices_fixed here, not the int32 gather-path copy.
     """
-    n, k = indices.shape
+    k = indices_i64.shape[1]
+    rows = torch.arange(n, device=device).repeat_interleave(k)
+    cols = indices_i64.reshape(-1)
+    vals = w_norm.reshape(-1)
+    return torch.sparse_coo_tensor(
+        torch.stack([rows, cols]), vals, size=(n, n), device=device,
+        check_invariants=False,
+    ).coalesce()
 
-    # --- weighted barycenter ---
-    neighbor_pos = X[indices]                                   # (n, k, d)
-    revised_d = (w.unsqueeze(-1) * neighbor_pos).sum(dim=1) / denom   # (n, d)
 
-    # --- movement magnitude ---
-    diff = revised_d - X
-    dist_move = diff.norm(dim=1)                                
-    
-    moved = dist_move >= 1e-8   
+def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_precision_dtype=torch.bfloat16):
+    """
+    Compiled, dense-only kernel: given X and (for the gather path) the
+    fixed neighbour indices, produces the barycenter -- via gather+weighted
+    sum if needs_gather, or takes a precomputed barycenter tensor if not
+    (sparse path, where torch.sparse.mm already ran eagerly) -- then does
+    the movement math (diff, magnitude, optional clipping, update). Never
+    sees a sparse tensor, so it's safe to wrap in fullgraph=True.
 
-    if clipping and clip_mode > 0:
-        dists = (X.unsqueeze(1) - neighbor_pos).norm(dim=-1)
-        # sort preserves autograd graph for the extracted elements
-        median_dist = dists.sort(dim=1).values[:, k // 2]        
-        delta = (alpha * median_dist).clamp_min(1e-8)
+    Called as:
+      needs_gather=True  (dense path):  _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate)
+      needs_gather=False (sparse path): _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate)
+    In both cases the 3rd argument is either the (n, k) weight tensor
+    (gather path) or the already-computed (n, d) barycenter (sparse path);
+    which one it is is fixed by needs_gather, a closure constant.
+    """
 
-        if clip_mode == 1:
-            effective_step = dist_move * (delta / (delta + dist_move))
+    def _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate):
+        n, k = indices.shape
+        neighbor_pos = None
+
+        if needs_gather:
+            neighbor_pos = X[indices]                                  # (n, k, d) -- one gather
+            if low_precision:
+                lp_w = w_or_barycenter.to(low_precision_dtype)
+                lp_neighbors = neighbor_pos.to(low_precision_dtype)
+                barycenter = (lp_w.unsqueeze(-1) * lp_neighbors).sum(dim=1).to(X.dtype)
+            else:
+                barycenter = (w_or_barycenter.unsqueeze(-1) * neighbor_pos).sum(dim=1)
         else:
-            effective_step = torch.minimum(dist_move, delta)
+            barycenter = w_or_barycenter                                # already computed via sparse.mm outside
+
+        diff = barycenter - X
+        dist_move = diff.norm(dim=1)
+        moved = dist_move >= 1e-8
+
+        if clipping and clip_mode > 0:
+            if neighbor_pos is None:
+                neighbor_pos = X[indices]           # only extra gather needed under the sparse path
+            dists = (X.unsqueeze(1) - neighbor_pos).norm(dim=-1)
+            median_dist = dists.sort(dim=1).values[:, k // 2]
+            delta = (alpha * median_dist).clamp_min(1e-8)
+            if clip_mode == 1:
+                effective_step = dist_move * (delta / (delta + dist_move))
+            else:
+                effective_step = torch.minimum(dist_move, delta)
+        else:
+            effective_step = dist_move
+
+        dist_move_safe = dist_move.clamp_min(1e-12)
+        scale = (learning_rate * effective_step / dist_move_safe).unsqueeze(-1)
+
+        updated = X + gate * scale * diff
+        revised_d = torch.where(moved.unsqueeze(-1), updated, X)
+        change = torch.where(moved, dist_move, torch.zeros_like(dist_move))
+        return revised_d, change
+
+    return torch.compile(_kernel, fullgraph=True)
+
+
+def _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision, low_precision_dtype=torch.bfloat16):
+    """
+    Build the top-level shift step for a fixed
+    (clipping, clip_mode, use_sparse, low_precision) configuration. Call
+    once per model instance and reuse -- not per shift iteration.
+
+    Returns a plain (uncompiled) Python function -- it does the eager
+    torch.sparse.mm when use_sparse, then delegates to a compiled
+    dense-only movement kernel. The wrapper itself must stay uncompiled:
+    that's what keeps the sparse tensor from ever entering a compiled
+    region.
+    """
+    movement_kernel = _make_movement_kernel(
+        clipping, clip_mode, needs_gather=not use_sparse,
+        low_precision=low_precision, low_precision_dtype=low_precision_dtype,
+    )
+
+    if use_sparse:
+        def _shift(X, indices, w_or_W, learning_rate, alpha, gate):
+            barycenter = torch.sparse.mm(w_or_W, X)          # eager -- torch.compile can't wrap sparse tensors
+            return movement_kernel(X, indices, barycenter, learning_rate, alpha, gate)
     else:
-        effective_step = dist_move
+        def _shift(X, indices, w_or_W, learning_rate, alpha, gate):
+            return movement_kernel(X, indices, w_or_W, learning_rate, alpha, gate)
 
-    dist_move_safe = dist_move.clamp_min(1e-12)  
-    scale = (learning_rate * effective_step / dist_move_safe).unsqueeze(-1)  
+    return _shift
 
-    updated = X + gate * scale * diff
-    
-    # Use torch.where to avoid breaking gradients with in-place assignments
-    revised_d = torch.where(moved.unsqueeze(-1), updated, X)
-    change = torch.where(moved, dist_move, torch.zeros_like(dist_move))
 
-    return revised_d, change
+# Cache kernels across model instances that share the same config -- avoids
+# both a redundant Python closure build and (for the compiled inner
+# movement kernel) a redundant torch.compile trace for identical configs.
+_SHIFT_KERNEL_CACHE = {}
+
+
+def _get_shift_kernel(clipping, clip_mode, use_sparse, low_precision):
+    key = (clipping, clip_mode, use_sparse, low_precision)
+    if key not in _SHIFT_KERNEL_CACHE:
+        _SHIFT_KERNEL_CACHE[key] = _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision)
+    return _SHIFT_KERNEL_CACHE[key]
 
 
 # ---------------------------------------------------------------------------
@@ -603,7 +721,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         keep_trajectory=False,
         log_file=None,
         use_chunking=False,
-        weight_chunk_size=2048,
+        weight_chunk_size=4096,
         temperature=None,
         eps=None,
         enable_gradients=True,
@@ -611,6 +729,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         learn_learning_rate=False,
         learn_alpha=False,
         learn_eps=False,
+        use_sparse_shift=True,
+        low_precision_barycenter=False,
     ):
         super().__init__()
 
@@ -638,6 +758,15 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.enable_gradients = enable_gradients
         self.log_file = log_file
         self.learn_eps = learn_eps
+
+        # Resolved once per instance (device doesn't change afterward), not
+        # per forward() call: whether to use the sparse-spmm barycenter path
+        # (no per-iteration (n, k, d) gather) vs. the dense gather fallback.
+        self.use_sparse_shift = use_sparse_shift and _sparse_mm_supported(device)
+        self.low_precision_barycenter = low_precision_barycenter
+        self._shift_kernel = _get_shift_kernel(
+            self.clipping, self.clip_mode, self.use_sparse_shift, self.low_precision_barycenter
+        )
 
         dtype = next(
             (value.dtype for value in (learning_rate, alpha, temperature, eps)
@@ -732,10 +861,25 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         )
 
         with torch.no_grad():
-            indices_fixed = compute_fixed_knn(X, self.k, device=self.device_name)
+            # int64 needed for torch.sparse_coo_tensor's index tensor; int32
+            # halves gather bandwidth for the dense fallback path and for the
+            # clipping-only gather under the sparse path. Safe given n <=
+            # ~100k always fits comfortably in int32's range -- if you ever
+            # run this on datasets north of ~2^31 points, keep indices_fixed
+            # as int64 instead.
+            indices_fixed_i64 = compute_fixed_knn(X, self.k, device=self.device_name)
+            indices_fixed = indices_fixed_i64.to(torch.int32)
 
-        w = base_weights_t[indices_fixed]                                   # (n, k)
+        w = base_weights_t[indices_fixed_i64]                        # (n, k)
         denom = w.sum(dim=1, keepdim=True).clamp_min(1e-6)          # (n, 1)
+        w_norm = w / denom                                           # fold the divide in once, not per iteration
+
+        if self.use_sparse_shift:
+            w_or_W = _build_sparse_weight_matrix(
+                indices_fixed_i64, w_norm, n_samples, self.device_name
+            )
+        else:
+            w_or_W = w_norm
 
         for iter_count in range(self.max_iters_shift):
             gate = _scheduled_gate(
@@ -748,13 +892,11 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                 shifted_dataset.dtype,
             )
 
-            revised_d, change = shift_data(
+            revised_d, change = self._shift_kernel(
                 shifted_dataset,
                 indices_fixed,
-                w, denom,
+                w_or_W,
                 self.learning_rate,
-                self.clipping,
-                self.clip_mode,
                 self.alpha,
                 gate,
             )
