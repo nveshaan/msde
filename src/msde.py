@@ -398,6 +398,7 @@ def _calculate_eps_from_similarity(S, n, nbd_sample_count_threshold,
     return torch.tensor(eps_value, dtype=torch.float32, device=S.device)
 
 
+# TODO: remove duplicate _sparse_similarity_layout, when using chunking
 def compute_weights_from_similarity_chunked(S, n, nbd_sample_count_threshold,
                                             satisfiability_proportion, max_iters_weight_count,
                                             chunk_size, temperature=None, eps=None):
@@ -531,26 +532,6 @@ def get_empirical_weights(
             max_iters_weight_count, temperature, eps
         )
 
-
-# ---------------------------------------------------------------------------
-# Core shift kernel
-#
-# Two structurally different kernels, selected once per model instance
-# (not per call):
-#
-#   sparse path : barycenter = torch.sparse.mm(W, X), where W is the
-#                 (n, n) row-normalized neighbour-weight matrix, built once
-#                 (indices_fixed + w_norm are loop-invariant across shift
-#                 iterations). No (n, k, d) gather every iteration.
-#   gather path : original X[indices] gather + weighted sum. Used when
-#                 sparse ops aren't supported on the target device (see
-#                 _sparse_mm_supported) or explicitly disabled.
-#
-# clipping / clip_mode / use_sparse / low_precision are captured as plain
-# Python closure constants, not passed as runtime tensor/scalar arguments,
-# so torch.compile traces one straight-line graph per config with no
-# runtime branch and no per-call guard/recompile risk.
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Core shift kernel
