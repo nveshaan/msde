@@ -512,8 +512,8 @@ def get_empirical_weights(
 def shift_data(
     X,
     indices,
-    dists,
-    base_weights,
+    w,
+    denom,
     learning_rate,
     clipping=False,
     clip_mode=0,       
@@ -547,9 +547,6 @@ def shift_data(
     n, k = indices.shape
 
     # --- weighted barycenter ---
-    w = base_weights[indices]                                   # (n, k)
-    denom = w.sum(dim=1, keepdim=True).clamp_min(1e-6)          # (n, 1)
-
     neighbor_pos = X[indices]                                   # (n, k, d)
     revised_d = (w.unsqueeze(-1) * neighbor_pos).sum(dim=1) / denom   # (n, d)
 
@@ -560,6 +557,7 @@ def shift_data(
     moved = dist_move >= 1e-8   
 
     if clipping and clip_mode > 0:
+        dists = (X.unsqueeze(1) - neighbor_pos).norm(dim=-1)
         # sort preserves autograd graph for the extracted elements
         median_dist = dists.sort(dim=1).values[:, k // 2]        
         delta = (alpha * median_dist).clamp_min(1e-8)
@@ -736,8 +734,10 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         with torch.no_grad():
             indices_fixed = compute_fixed_knn(X, self.k, device=self.device_name)
 
+        w = base_weights_t[indices_fixed]                                   # (n, k)
+        denom = w.sum(dim=1, keepdim=True).clamp_min(1e-6)          # (n, 1)
+
         for iter_count in range(self.max_iters_shift):
-            dists = compute_knn_dists(shifted_dataset, indices_fixed)
             gate = _scheduled_gate(
                 self.gate_scheduler,
                 iter_count,
@@ -751,8 +751,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             revised_d, change = shift_data(
                 shifted_dataset,
                 indices_fixed,
-                dists,
-                base_weights_t,
+                w, denom,
                 self.learning_rate,
                 self.clipping,
                 self.clip_mode,
