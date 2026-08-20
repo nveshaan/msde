@@ -106,6 +106,7 @@ def compute_fixed_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096):
     return indices
 
 
+@torch.compile(fullgraph=True)
 def compute_knn_dists(X, indices):
     """
     Compute pairwise distances from X to its fixed k-NN (by index).
@@ -507,6 +508,7 @@ def get_empirical_weights(
 # Core shift kernel 
 # ---------------------------------------------------------------------------
 
+@torch.compile(fullgraph=True)
 def shift_data(
     X,
     indices,
