@@ -65,20 +65,18 @@ def _scheduled_gate(scheduler, step, total_steps, start, end, device, dtype):
     return start + (end - start) * value
 
 
-# ---------------------------------------------------------------------------
-# Sparse-op support probe (cached per device string)
-#
-# torch.sparse_coo_tensor / torch.sparse.mm historically raised
-# NotImplementedError on the MPS backend; support has landed on some
-# recent builds but isn't guaranteed for every torch/macOS combination.
-# Probe once per device, cache the result, and let callers fall back to
-# the dense gather-based path instead of hard-crashing.
-# ---------------------------------------------------------------------------
-
 _SPARSE_MM_SUPPORT_CACHE = {}
 
-
 def _sparse_mm_supported(device):
+    """
+    Sparse-op support probe (cached per device string)
+    
+    torch.sparse_coo_tensor / torch.sparse.mm historically raised
+    NotImplementedError on the MPS backend; support has landed on some
+    recent builds but isn't guaranteed for every torch/macOS combination.
+    Probe once per device, cache the result, and let callers fall back to
+    the dense gather-based path instead of hard-crashing.
+    """
     if device in _SPARSE_MM_SUPPORT_CACHE:
         return _SPARSE_MM_SUPPORT_CACHE[device]
     try:
@@ -93,11 +91,32 @@ def _sparse_mm_supported(device):
     return supported
 
 
-# ---------------------------------------------------------------------------
-# k-NN (brute-force, GPU, chunked over the query dimension)
-# ---------------------------------------------------------------------------
+_KNN_CHUNK_KERNEL_CACHE = {}
 
-def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096):
+
+def _make_knn_chunk_kernel(k):
+    def _kernel(X_chunk, X_full):
+        d = torch.cdist(X_chunk, X_full)          # (chunk, n) - compares to ALL N
+        return d.topk(k, largest=False, dim=1)
+    return torch.compile(_kernel, fullgraph=True)
+
+
+def _get_knn_chunk_kernel(k):
+    """
+    Cached per k (closure constant -- topk's k must be a compile-time
+    constant). torch_knn is called with the same k repeatedly (k=self.k for
+    the shift graph, k=15 for the fuzzy-similarity graph), so this is a
+    compile-once-reuse-many-forward()-calls win. The trailing, possibly
+    undersized chunk (when n isn't a multiple of chunk_size) triggers one
+    extra recompile for that distinct shape the first time it's seen, then
+    is cached same as any other shape.
+    """
+    if k not in _KNN_CHUNK_KERNEL_CACHE:
+        _KNN_CHUNK_KERNEL_CACHE[k] = _make_knn_chunk_kernel(k)
+    return _KNN_CHUNK_KERNEL_CACHE[k]
+
+
+def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192):
     """
     Exact brute-force k-NN on GPU via chunked cdist + topk.
     Maintains autograd flow for distances if X requires_grad.
@@ -117,11 +136,11 @@ def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096):
     # Store dists in a list and cat them to preserve autograd graph 
     # (inplace assignments on requires_grad tensors throw errors)
     all_dist_list = []
+    chunk_kernel = _get_knn_chunk_kernel(k)
 
     for start in range(0, n, chunk_size):
         end = min(n, start + chunk_size)
-        d = torch.cdist(X[start:end], X)          # (chunk, n) - compares to ALL N
-        dists, idx = d.topk(k, largest=False, dim=1)
+        dists, idx = chunk_kernel(X[start:end], X)
         all_idx[start:end] = idx
         all_dist_list.append(dists)
 
@@ -134,19 +153,38 @@ def compute_fixed_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096):
     return indices
 
 
-@torch.compile(fullgraph=True)
-def compute_knn_dists(X, indices):
-    """
-    Compute pairwise distances from X to its fixed k-NN (by index).
-    Differentiable w.r.t X.
-    """
-    diff = X.unsqueeze(1) - X[indices]     # (n, k, d)
-    return diff.norm(dim=-1)
+def _make_symmetrize_kernel():
+    def _kernel(knn_dists, knn_indices, rhos, sigma, n, k):
+        dists_shifted = torch.clamp(knn_dists - rhos[:, None], min=0.0)
+        weights = torch.exp(-dists_shifted / sigma[:, None])
+
+        rows = torch.arange(n, device=knn_dists.device).repeat_interleave(k)
+        cols = knn_indices.reshape(-1)
+        vals = weights.reshape(-1)
+
+        # Symmetrize on GPU (Autograd safe through fancy indexing)
+        fwd_keys = rows * n + cols
+        rev_keys = cols * n + rows
+
+        sort_idx = torch.argsort(fwd_keys)
+        sorted_keys = fwd_keys[sort_idx]
+        sorted_vals = vals[sort_idx]
+
+        pos = torch.searchsorted(sorted_keys, rev_keys)
+        pos = torch.clamp(pos, max=sorted_keys.shape[0] - 1)
+        matched = sorted_keys[pos] == rev_keys
+        w_rev = torch.where(matched, sorted_vals[pos], torch.zeros_like(vals))
+
+        w_sym = vals + w_rev - vals * w_rev
+        return rows, cols, w_sym
+
+    return torch.compile(_kernel, fullgraph=True)
 
 
-# ---------------------------------------------------------------------------
-# Fuzzy simplicial set (UMAP graph), fully vectorized on GPU
-# ---------------------------------------------------------------------------
+# Single config (no branching on any Python constant), so one instance
+# suffices -- built once at import time.
+_SYMMETRIZE_KERNEL = _make_symmetrize_kernel()
+
 
 def fuzzy_simplicial_set_torch(knn_indices, knn_dists, n, n_neighbors, n_epochs=200,
                                 device=DEFAULT_DEVICE):
@@ -159,6 +197,8 @@ def fuzzy_simplicial_set_torch(knn_indices, knn_dists, n, n_neighbors, n_epochs=
 
     # Compute binary search targets (rho and sigma) WITHOUT tracking gradients
     # so we don't build a massive, unstable autograd graph inside the loop.
+    # NOT compiled: inherently sequential (each step depends on the last)
+    # and syncs via bool(...) every iteration -- compile can't remove that.
     with torch.no_grad():
         mask = knn_dists > 0
         rhos_ng = torch.where(mask, knn_dists, torch.tensor(float("inf"), device=device))
@@ -193,31 +233,14 @@ def fuzzy_simplicial_set_torch(knn_indices, knn_dists, n, n_neighbors, n_epochs=
 
     # Now back in autograd land, recompute the actual weights using the fixed 
     # rho and sigma constants, allowing gradients to flow to knn_dists and thus X.
+    # Compiled: fixed-shape dense ops all the way through symmetrization.
     rhos = rhos_ng.detach()
     sigma = torch.clamp(sigma_ng.detach(), min=1e-10)
-    
-    dists_shifted = torch.clamp(knn_dists - rhos[:, None], min=0.0)
-    weights = torch.exp(-dists_shifted / sigma[:, None])
 
-    rows = torch.arange(n, device=device).repeat_interleave(k)
-    cols = knn_indices.reshape(-1)
-    vals = weights.reshape(-1)
+    rows, cols, w_sym = _SYMMETRIZE_KERNEL(knn_dists, knn_indices, rhos, sigma, n, k)
 
-    # Symmetrize on GPU (Autograd safe through fancy indexing)
-    fwd_keys = rows * n + cols
-    rev_keys = cols * n + rows
-
-    sort_idx = torch.argsort(fwd_keys)
-    sorted_keys = fwd_keys[sort_idx]
-    sorted_vals = vals[sort_idx]
-
-    pos = torch.searchsorted(sorted_keys, rev_keys)
-    pos = torch.clamp(pos, max=sorted_keys.shape[0] - 1)
-    matched = sorted_keys[pos] == rev_keys
-    w_rev = torch.where(matched, sorted_vals[pos], torch.zeros_like(vals))
-
-    w_sym = vals + w_rev - vals * w_rev
-
+    # NOT compiled: nonzero()'s output size is data-dependent, which
+    # fullgraph=True compilation can't handle as a fixed-shape graph.
     threshold = w_sym.max() / max(n_epochs, 1)
     active = torch.nonzero(w_sym >= threshold, as_tuple=True)[0]
 
@@ -271,6 +294,18 @@ def _sparse_similarity_layout(S):
     return rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq
 
 
+def _make_pairwise_dist_from_cross():
+    def _kernel(row_norm_sq, idx, cross):
+        sq_dist = row_norm_sq[:, None] + row_norm_sq[idx][None, :] - 2.0 * cross
+        return torch.sqrt(torch.clamp(sq_dist, min=0.0))
+    return torch.compile(_kernel, fullgraph=True)
+
+
+# Single config, device/shape-agnostic (torch.compile guards+recompiles per
+# shape internally) -- built once at import time.
+_PAIRWISE_DIST_KERNEL = _make_pairwise_dist_from_cross()
+
+
 def _chunk_pairwise_dist(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, start, end):
     """
     Distances from every point (n) to the points in row-range [start, end),
@@ -279,6 +314,13 @@ def _chunk_pairwise_dist(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_
     against all n rows via one sparse @ dense matmul, then finish with
     ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>.
     Returns dist (n, chunk) and idx (chunk,) -- the absolute row indices.
+
+    The sparse.mm stays eager (torch.compile can't wrap a sparse-tensor
+    argument, same limitation as the shift kernel's spmm); only the
+    dense distance-finishing math after it is compiled. This function is
+    called up to ~50x per eps binary-search call, per chunk, so the
+    compiled part gets reused heavily across a single forward() and across
+    the many forward() calls in a bench loop.
     """
     n = S.shape[0]
     device = S.device
@@ -289,10 +331,9 @@ def _chunk_pairwise_dist(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_
     chunk_dense[rows_sorted[lo:hi] - start, cols_sorted[lo:hi]] = vals_sorted[lo:hi]
 
     # Matrix multiply guarantees we compute similarity against ALL `N` points
-    cross = torch.sparse.mm(S, chunk_dense.T)
+    cross = torch.sparse.mm(S, chunk_dense.T)                 # eager
     idx = torch.arange(start, end, device=device)
-    sq_dist = row_norm_sq[:, None] + row_norm_sq[idx][None, :] - 2.0 * cross
-    dist = torch.sqrt(torch.clamp(sq_dist, min=0.0))
+    dist = _PAIRWISE_DIST_KERNEL(row_norm_sq, idx, cross)      # compiled
     return dist, idx
 
 
@@ -367,9 +408,17 @@ def _binary_search_eps_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr
     return result, found
 
 
-def _calculate_eps_from_similarity(S, n, nbd_sample_count_threshold,
+def _calculate_eps_from_similarity(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
+                                   n, nbd_sample_count_threshold,
                                    satisfiability_proportion, chunk_size):
-    rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq = _sparse_similarity_layout(S)
+    """
+    Takes the sparse-similarity layout (rows_sorted, cols_sorted,
+    vals_sorted, row_ptr, row_norm_sq) as input instead of rebuilding it
+    via _sparse_similarity_layout -- callers that already have the layout
+    (compute_weights_from_similarity_chunked, MeanShiftDensityEnhancement's
+    learn_eps branch in forward()) no longer pay for a second
+    searchsorted + scatter_add pass over the whole graph just to get eps.
+    """
     max_dist, min_dist = _min_max_dist_chunked(
         S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, chunk_size
     )
@@ -398,21 +447,27 @@ def _calculate_eps_from_similarity(S, n, nbd_sample_count_threshold,
     return torch.tensor(eps_value, dtype=torch.float32, device=S.device)
 
 
-# TODO: remove duplicate _sparse_similarity_layout, when using chunking
+# TODO fixed: layout built once here and reused for eps -- no second
+# _sparse_similarity_layout pass. `layout`, if provided, lets a caller that
+# already built one (forward()'s learn_eps branch) share it instead of this
+# function building its own.
 def compute_weights_from_similarity_chunked(S, n, nbd_sample_count_threshold,
                                             satisfiability_proportion, max_iters_weight_count,
-                                            chunk_size, temperature=None, eps=None):
+                                            chunk_size, temperature=None, eps=None, layout=None):
     """
     Chunked (memory-bounded, exact) replacement for the original dense
     per-batch weight computation. Operates on the entire similarity graph
     `S` as a single logical batch.
     """
-    rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq = _sparse_similarity_layout(S)
+    if layout is None:
+        layout = _sparse_similarity_layout(S)
+    rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq = layout
 
     if eps is None:
         with torch.no_grad():
             eps_tensor = _calculate_eps_from_similarity(
-                S, n, nbd_sample_count_threshold,
+                S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
+                n, nbd_sample_count_threshold,
                 satisfiability_proportion, chunk_size,
             )
     else:
@@ -421,7 +476,7 @@ def compute_weights_from_similarity_chunked(S, n, nbd_sample_count_threshold,
     delta = (eps_tensor - 1e-6) / max_iters_weight_count
     total_counts = torch.zeros(n, dtype=torch.float32, device=S.device)
     eps_running = eps_tensor
-    
+
     for _ in range(max_iters_weight_count):
         total_counts = total_counts + radius_counts_chunked(
             S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, eps_running, chunk_size, temperature
@@ -429,6 +484,29 @@ def compute_weights_from_similarity_chunked(S, n, nbd_sample_count_threshold,
         eps_running = eps_running - delta
 
     return total_counts / max_iters_weight_count
+
+
+_DENSE_WEIGHT_STEP_CACHE = {}
+
+
+def _make_dense_weight_step(has_temperature):
+    def _step(dist, eps_running, temperature):
+        if has_temperature:
+            return torch.sigmoid((eps_running - dist) / temperature).sum(dim=1) - torch.sigmoid(eps_running / temperature)
+        else:
+            return (dist < eps_running).sum(dim=1).float() - 1.0
+    return torch.compile(_step, fullgraph=True)
+
+
+def _get_dense_weight_step(has_temperature):
+    """
+    Cached per has_temperature (a fixed, per-model-instance setting) --
+    baked as a closure constant rather than passed as a runtime arg so the
+    `if` never appears inside the compiled graph.
+    """
+    if has_temperature not in _DENSE_WEIGHT_STEP_CACHE:
+        _DENSE_WEIGHT_STEP_CACHE[has_temperature] = _make_dense_weight_step(has_temperature)
+    return _DENSE_WEIGHT_STEP_CACHE[has_temperature]
 
 
 def compute_weights_from_similarity_dense(S, n, nbd_sample_count_threshold,
@@ -492,14 +570,10 @@ def compute_weights_from_similarity_dense(S, n, nbd_sample_count_threshold,
     delta = (eps_tensor - 1e-6) / max_iters_weight_count
     total_counts = torch.zeros(n, dtype=torch.float32, device=S.device)
     eps_running = eps_tensor
-    
+
+    step_fn = _get_dense_weight_step(temperature is not None)
     for _ in range(max_iters_weight_count):
-        if temperature is not None:
-            counts = torch.sigmoid((eps_running - dist) / temperature).sum(dim=1) - torch.sigmoid(eps_running / temperature)
-        else:
-            counts = (dist < eps_running).sum(dim=1).float() - 1.0
-            
-        total_counts = total_counts + counts
+        total_counts = total_counts + step_fn(dist, eps_running, temperature)
         eps_running = eps_running - delta
 
     return total_counts / max_iters_weight_count
@@ -618,7 +692,7 @@ def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_
         if clipping and clip_mode > 0:
             if neighbor_pos is None:
                 neighbor_pos = X[indices]           # only extra gather needed under the sparse path
-            dists = (X.unsqueeze(1) - neighbor_pos).norm(dim=-1)
+            dists = torch.cdist(X.unsqueeze(1), neighbor_pos).squeeze(1)
             median_dist = dists.sort(dim=1).values[:, k // 2]
             delta = (alpha * median_dist).clamp_min(1e-8)
             if clip_mode == 1:
@@ -786,9 +860,12 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
 
         if self.learn_eps and self.eps is None:
             similarity = _build_sparse_similarity(X, 15, 200, self.device_name)
+            # Build once, reuse for both the eps calc below and the chunked weight pass that follows
+            layout = _sparse_similarity_layout(similarity)
             with torch.no_grad():
                 eps_initial = _calculate_eps_from_similarity(
                     similarity,
+                    *layout,
                     X.shape[0],
                     self.nbd_sample_count_threshold,
                     0.3,
@@ -808,6 +885,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                     self.weight_chunk_size,
                     self.temperature,
                     self.eps,
+                    layout=layout,
                 )
             else:
                 base_weights_t = compute_weights_from_similarity_dense(
@@ -852,7 +930,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             indices_fixed = indices_fixed_i64.to(torch.int32)
 
         w = base_weights_t[indices_fixed_i64]                        # (n, k)
-        denom = w.sum(dim=1, keepdim=True).clamp_min(1e-6)          # (n, 1)
+        denom = w.sum(dim=1, keepdim=True).clamp_min(1e-6)           # (n, 1)
         w_norm = w / denom                                           # fold the divide in once, not per iteration
 
         if self.use_sparse_shift:
