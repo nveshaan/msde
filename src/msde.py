@@ -45,26 +45,6 @@ def _configure_logging(log_file):
         logger.setLevel(logging.CRITICAL + 1)
 
 
-def _scheduled_gate(scheduler, step, total_steps, start, end, device, dtype):
-    if scheduler is None:
-        return torch.as_tensor(1.0, device=device, dtype=dtype)
-
-    progress = 1.0 if total_steps <= 1 else step / (total_steps - 1)
-    if scheduler == "linear":
-        value = progress
-    elif scheduler == "cosine":
-        value = 0.5 * (1.0 - torch.cos(torch.tensor(progress * torch.pi)))
-    elif callable(scheduler):
-        value = scheduler(step, total_steps)
-    else:
-        raise ValueError("gate_scheduler must be None, 'linear', 'cosine', or callable")
-
-    value = torch.as_tensor(value, device=device, dtype=dtype)
-    if value.numel() != 1:
-        raise ValueError("gate_scheduler must return a scalar")
-    return start + (end - start) * value
-
-
 _SPARSE_MM_SUPPORT_CACHE = {}
 
 def _sparse_mm_supported(device):
@@ -769,9 +749,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         clipping=False,
         clip_mode=0,
         alpha=0.5,
-        gate_scheduler=None,
-        gate_start=0.0,
-        gate_end=1.0,
         device=DEFAULT_DEVICE,
         keep_trajectory=False,
         log_file=None,
@@ -799,13 +776,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.shift_threshold = shift_threshold
         self.clipping = clipping
         self.clip_mode = clip_mode
-        if gate_scheduler is not None and not isinstance(gate_scheduler, str) and not callable(gate_scheduler):
-            raise TypeError("gate_scheduler must be None, 'linear', 'cosine', or callable")
-        if isinstance(gate_scheduler, str) and gate_scheduler not in ("linear", "cosine"):
-            raise ValueError("gate_scheduler must be None, 'linear', 'cosine', or callable")
-        self.gate_scheduler = gate_scheduler
-        self.gate_start = gate_start
-        self.gate_end = gate_end
         self.device_name = device
         self.keep_trajectory = keep_trajectory
         self.use_chunking = use_chunking
@@ -853,7 +823,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
 
         _configure_logging(log_file)
 
-    def forward(self, X):
+    def forward(self, X, gate=1.0):
         """Run MSDE and return shifted data, movement, and trajectory."""
         if not self.enable_gradients:
             X = X.detach()
@@ -941,16 +911,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             w_or_W = w_norm
 
         for iter_count in range(self.max_iters_shift):
-            gate = _scheduled_gate(
-                self.gate_scheduler,
-                iter_count,
-                self.max_iters_shift,
-                self.gate_start,
-                self.gate_end,
-                shifted_dataset.device,
-                shifted_dataset.dtype,
-            )
-
             revised_d, change = self._shift_kernel(
                 shifted_dataset,
                 indices_fixed,
