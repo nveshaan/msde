@@ -427,10 +427,6 @@ def _calculate_eps_from_similarity(S, rows_sorted, cols_sorted, vals_sorted, row
     return torch.tensor(eps_value, dtype=torch.float32, device=S.device)
 
 
-# TODO fixed: layout built once here and reused for eps -- no second
-# _sparse_similarity_layout pass. `layout`, if provided, lets a caller that
-# already built one (forward()'s learn_eps branch) share it instead of this
-# function building its own.
 def compute_weights_from_similarity_chunked(S, n, nbd_sample_count_threshold,
                                             satisfiability_proportion, max_iters_weight_count,
                                             chunk_size, temperature=None, eps=None, layout=None):
