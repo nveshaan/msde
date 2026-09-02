@@ -759,6 +759,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         learn_eps=False,
         use_sparse_shift=True,
         low_precision_barycenter=False,
+        recompute_neighbors=0,
     ):
         super().__init__()
 
@@ -766,6 +767,15 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             raise ValueError("learn_temperature=True requires an explicit initial temperature")
         if learn_eps and temperature is None:
             raise ValueError("learn_eps=True requires temperature to enable differentiable weights")
+        if recompute_neighbors is not None and (
+            not isinstance(recompute_neighbors, int) or isinstance(recompute_neighbors, bool) or recompute_neighbors < 0
+        ):
+            raise ValueError(
+                "recompute_neighbors must be None, 0 (never recompute after the "
+                "first iteration -- original fixed-graph behaviour), or a "
+                "positive int N (recompute the neighbour graph every N "
+                "iterations, i.e. at iter_count 0, N, 2N, ...)."
+            )
         self.k = k
         self.nbd_sample_count_threshold = nbd_sample_count_threshold
         self.max_iters_shift = max_iters_shift
@@ -779,6 +789,9 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.enable_gradients = enable_gradients
         self.log_file = log_file
         self.learn_eps = learn_eps
+        # Normalize None -> 0 so the forward()-loop guard can treat both as
+        # "falsy => never recompute after the first iteration" uniformly.
+        self.recompute_neighbors = recompute_neighbors or 0
 
         # Resolved once per instance (device doesn't change afterward), not
         # per forward() call: whether to use the sparse-spmm barycenter path
@@ -885,28 +898,58 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             f"Computing fixed k-NN (k={self.k}) in feature space on {self.device_name} ..."
         )
 
-        with torch.no_grad():
-            # int64 needed for torch.sparse_coo_tensor's index tensor; int32
-            # halves gather bandwidth for the dense fallback path and for the
-            # clipping-only gather under the sparse path. Safe given n <=
-            # ~100k always fits comfortably in int32's range -- if you ever
-            # run this on datasets north of ~2^31 points, keep indices_fixed
-            # as int64 instead.
-            indices_fixed_i64 = compute_fixed_knn(X, self.k, device=self.device_name)
-            indices_fixed = indices_fixed_i64.to(torch.int32)
-
-        w = base_weights_t[indices_fixed_i64]                        # (n, k)
-        denom = w.sum(dim=1, keepdim=True).clamp_min(1e-6)           # (n, 1)
-        w_norm = w / denom                                           # fold the divide in once, not per iteration
-
-        if self.use_sparse_shift:
-            w_or_W = _build_sparse_weight_matrix(
-                indices_fixed_i64, w_norm, n_samples, self.device_name
-            )
-        else:
-            w_or_W = w_norm
+        # indices_fixed / w_norm / w_or_W are (re)built either once, before
+        # the loop (recompute_neighbors=0/None -- original "fixed neighbour
+        # graph" behaviour, cheapest), or every N iterations
+        # (recompute_neighbors=N -- periodic adaptive mean-shift: the
+        # neighbour graph tracks shifted_dataset every N steps instead of
+        # every step, damping the runaway-collapse feedback loop that
+        # recomputing every single iteration produces -- see below). The
+        # block itself is identical in every case; only *when* it runs
+        # changes, via the `iter_count == 0 or iter_count % self.recompute_neighbors == 0`
+        # guard below. iter_count == 0 always (re)builds it regardless of N,
+        # since indices_fixed/w_or_W don't exist yet on the first pass.
+        #
+        # Note base_weights_t itself is NOT recomputed here even when
+        # recompute_neighbors is set -- it comes from a separate, far more
+        # expensive pipeline (get_empirical_weights's eps binary search over
+        # the *original* X) and is treated as a static "how typical is this
+        # point" prior. Only the neighbour topology used for the barycenter
+        # gather/spmm is refreshed. Recomputing base_weights_t on the
+        # shifted data would be possible too, but multiplies the dominant
+        # cost of forward() by (max_iters_shift // N) -- do that only if you
+        # have a specific reason the density prior itself needs to track the
+        # shift, not just the neighbour set.
+        indices_fixed = None
+        w_or_W = None
 
         for iter_count in range(self.max_iters_shift):
+            if iter_count == 0 or (
+                self.recompute_neighbors and iter_count % self.recompute_neighbors == 0
+            ):
+                with torch.no_grad():
+                    # int64 needed for torch.sparse_coo_tensor's index tensor;
+                    # int32 halves gather bandwidth for the dense fallback path
+                    # and for the clipping-only gather under the sparse path.
+                    # Safe given n <= ~100k always fits comfortably in int32's
+                    # range -- if you ever run this on datasets north of
+                    # ~2^31 points, keep indices_fixed as int64 instead.
+                    indices_fixed_i64 = compute_fixed_knn(
+                        shifted_dataset.detach(), self.k, device=self.device_name
+                    )
+                    indices_fixed = indices_fixed_i64.to(torch.int32)
+
+                w = base_weights_t[indices_fixed_i64]                        # (n, k)
+                denom = w.sum(dim=1, keepdim=True).clamp_min(1e-6)           # (n, 1)
+                w_norm = w / denom                                           # fold the divide in once, not per iteration
+
+                if self.use_sparse_shift:
+                    w_or_W = _build_sparse_weight_matrix(
+                        indices_fixed_i64, w_norm, n_samples, self.device_name
+                    )
+                else:
+                    w_or_W = w_norm
+
             revised_d, change = self._shift_kernel(
                 shifted_dataset,
                 indices_fixed,
