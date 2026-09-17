@@ -96,7 +96,7 @@ def _get_knn_chunk_kernel(k):
     return _KNN_CHUNK_KERNEL_CACHE[k]
 
 
-def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192):
+def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192, corpus=None):
     """
     Exact brute-force k-NN on GPU via chunked cdist + topk.
     Maintains autograd flow for distances if X requires_grad.
@@ -104,12 +104,19 @@ def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192):
     MEMORY NOTE: This does NOT "batch" the dataset mathematically. Every point
     finds its true neighbors across the *entire* dataset X (O(N) search space). 
     chunk_size merely streams the outer loop to bound peak VRAM to O(chunk_size * N).
+
+    corpus : optional (m, d) tensor. When given, every point in X is
+        searched for its k nearest neighbours *within `corpus`* instead of
+        within X itself (cross k-NN against a fixed reference set). When
+        omitted, behaviour is unchanged: X is searched against itself.
     
     Returns
     -------
-    knn_indices : LongTensor (n, k) on device
+    knn_indices : LongTensor (n, k) on device -- indices into `corpus` if
+        given, otherwise into X.
     knn_dists   : FloatTensor (n, k) on device
     """
+    X_full = corpus if corpus is not None else X
     n = X.shape[0]
     all_idx = torch.empty((n, k), dtype=torch.long, device=device)
     
@@ -120,7 +127,7 @@ def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192):
 
     for start in range(0, n, chunk_size):
         end = min(n, start + chunk_size)
-        dists, idx = chunk_kernel(X[start:end], X)
+        dists, idx = chunk_kernel(X[start:end], X_full)
         all_idx[start:end] = idx
         all_dist_list.append(dists)
 
@@ -128,8 +135,8 @@ def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192):
     return all_idx, all_dist
 
 
-def compute_fixed_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096):
-    indices, _ = torch_knn(X, k, device=device, chunk_size=chunk_size)
+def compute_fixed_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096, corpus=None):
+    indices, _ = torch_knn(X, k, device=device, chunk_size=chunk_size, corpus=corpus)
     return indices
 
 
@@ -610,21 +617,28 @@ def get_empirical_weights(
 # per-call guard/recompile risk.
 # ---------------------------------------------------------------------------
 
-def _build_sparse_weight_matrix(indices_i64, w_norm, n, device):
+def _build_sparse_weight_matrix(indices_i64, w_norm, n_rows, n_cols, device):
     """
-    (n, n) sparse COO weight matrix from a fixed (n, k) neighbour index
-    table and its row-normalized weights. Built once per forward() call
-    (indices_fixed and w_norm don't change across shift iterations), then
-    reused every iteration via torch.sparse.mm(W, X) in place of a fresh
-    gather. NOTE: sparse_coo_tensor indices must be int64 -- pass the
-    int64 copy of indices_fixed here, not the int32 gather-path copy.
+    (n_rows, n_cols) sparse COO weight matrix from a fixed (n_rows, k)
+    neighbour index table and its row-normalized weights. Built once per
+    forward() call (indices_fixed and w_norm don't change across shift
+    iterations), then reused every iteration via torch.sparse.mm(W, corpus)
+    in place of a fresh gather. NOTE: sparse_coo_tensor indices must be
+    int64 -- pass the int64 copy of indices_fixed here, not the int32
+    gather-path copy.
+
+    n_rows is the number of query points (shifted_dataset); n_cols is the
+    number of points being searched/gathered from (the corpus -- either
+    shifted_dataset itself in self-shift mode, or the fixed reference
+    manifold in reference-shift mode). They're equal in self-shift mode
+    and generally differ in reference-shift mode.
     """
     k = indices_i64.shape[1]
-    rows = torch.arange(n, device=device).repeat_interleave(k)
+    rows = torch.arange(n_rows, device=device).repeat_interleave(k)
     cols = indices_i64.reshape(-1)
     vals = w_norm.reshape(-1)
     return torch.sparse_coo_tensor(
-        torch.stack([rows, cols]), vals, size=(n, n), device=device,
+        torch.stack([rows, cols]), vals, size=(n_rows, n_cols), device=device,
         check_invariants=False,
     ).coalesce()
 
@@ -639,19 +653,25 @@ def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_
     sees a sparse tensor, so it's safe to wrap in fullgraph=True.
 
     Called as:
-      needs_gather=True  (dense path):  _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate)
-      needs_gather=False (sparse path): _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate)
+      needs_gather=True  (dense path):  _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate, corpus)
+      needs_gather=False (sparse path): _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate, corpus)
     In both cases the 3rd argument is either the (n, k) weight tensor
     (gather path) or the already-computed (n, d) barycenter (sparse path);
     which one it is is fixed by needs_gather, a closure constant.
+
+    `corpus` is the (m, d) tensor that `indices` index into -- the points
+    being gathered/shifted towards. In self-shift mode this is X itself
+    (m == n); in reference-shift mode it's the fixed reference manifold
+    (m can differ from n). Passing it explicitly, rather than always
+    reading from X, is what lets the same kernel serve both modes.
     """
 
-    def _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate):
+    def _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate, corpus):
         n, k = indices.shape
         neighbor_pos = None
 
         if needs_gather:
-            neighbor_pos = X[indices]                                  # (n, k, d) -- one gather
+            neighbor_pos = corpus[indices]                              # (n, k, d) -- one gather
             if low_precision:
                 lp_w = w_or_barycenter.to(low_precision_dtype)
                 lp_neighbors = neighbor_pos.to(low_precision_dtype)
@@ -667,7 +687,7 @@ def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_
 
         if clipping and clip_mode > 0:
             if neighbor_pos is None:
-                neighbor_pos = X[indices]           # only extra gather needed under the sparse path
+                neighbor_pos = corpus[indices]      # only extra gather needed under the sparse path
             dists = torch.cdist(X.unsqueeze(1), neighbor_pos).squeeze(1)
             median_dist = dists.sort(dim=1).values[:, k // 2]
             delta = (alpha * median_dist).clamp_min(1e-8)
@@ -707,12 +727,12 @@ def _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision, low_preci
     )
 
     if use_sparse:
-        def _shift(X, indices, w_or_W, learning_rate, alpha, gate):
-            barycenter = torch.sparse.mm(w_or_W, X)          # eager -- torch.compile can't wrap sparse tensors
-            return movement_kernel(X, indices, barycenter, learning_rate, alpha, gate)
+        def _shift(X, indices, w_or_W, learning_rate, alpha, gate, corpus):
+            barycenter = torch.sparse.mm(w_or_W, corpus)      # eager -- torch.compile can't wrap sparse tensors
+            return movement_kernel(X, indices, barycenter, learning_rate, alpha, gate, corpus)
     else:
-        def _shift(X, indices, w_or_W, learning_rate, alpha, gate):
-            return movement_kernel(X, indices, w_or_W, learning_rate, alpha, gate)
+        def _shift(X, indices, w_or_W, learning_rate, alpha, gate, corpus):
+            return movement_kernel(X, indices, w_or_W, learning_rate, alpha, gate, corpus)
 
     return _shift
 
@@ -760,7 +780,17 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         use_sparse_shift=True,
         low_precision_barycenter=False,
         recompute_neighbors=0,
+        X=None,
     ):
+        """
+        X : optional (m, d) tensor -- a fixed reference manifold. When
+            given, forward() no longer shifts its input against itself:
+            every point of the (different) X passed to forward() is
+            instead shifted with respect to neighbours found in *this* X,
+            which stays fixed for the lifetime of the module. When omitted
+            (default), forward() behaves as before -- each call's X is
+            shifted with respect to itself.
+        """
         super().__init__()
 
         if learn_temperature and temperature is None:
@@ -830,13 +860,54 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             else:
                 self.register_buffer(name, scalar)
 
+        # Reference-manifold mode: X given here is a fixed corpus that
+        # every future forward(X_new) shifts X_new against, instead of
+        # X_new shifting against itself. See set_reference_manifold() for
+        # updating/clearing it after construction.
+        self.set_reference_manifold(X)
+
         _configure_logging(log_file)
 
-    def forward(self, X, gate=1.0):
-        """Run MSDE and return shifted data, movement, and trajectory."""
-        if not self.enable_gradients:
-            X = X.detach()
+    def set_reference_manifold(self, X):
+        """
+        Set, replace, or clear the fixed reference manifold used by
+        forward() -- outside of and after __init__.
 
+        X : (n_ref, d) tensor/array-like, or None.
+            If not None, becomes the new self.X_ref: forward()'s future
+            calls will shift their (different) input against neighbours
+            found in this fixed manifold instead of against themselves.
+            Its neighbour-density weights are (re)computed once here, not
+            per forward() call, since the manifold is fixed until this
+            method is called again. Stored detached/no-grad -- it's meant
+            as fixed reference data, not something trained via forward()'s
+            gradients.
+            If None, clears any existing reference manifold: forward()
+            reverts to shifting its input against itself.
+        """
+        if X is not None:
+            X_ref = torch.as_tensor(X, device=self.device_name).detach()
+            if X_ref.dim() != 2:
+                raise ValueError(
+                    f"X (reference manifold) must be 2D (n_ref, d); got shape {tuple(X_ref.shape)}"
+                )
+            self._buffers.pop("X_ref", None)
+            self.register_buffer("X_ref", X_ref)
+            with torch.no_grad():
+                self._ref_base_weights = self._compute_base_weights(self.X_ref).detach()
+        else:
+            self._buffers.pop("X_ref", None)
+            self.register_buffer("X_ref", None)
+            self._ref_base_weights = None
+
+    def _compute_base_weights(self, X):
+        """
+        The "how typical/dense is this point" prior, one weight per row of
+        `X`. Factored out of forward() so the same logic can be run either
+        on forward()'s own X (self-shift mode) or once, at init time, on
+        the fixed reference manifold (reference-shift mode) -- see
+        __init__ and forward() below.
+        """
         if self.learn_eps and self.eps is None:
             similarity = _build_sparse_similarity(X, 15, 200, self.device_name)
             # Build once, reuse for both the eps calc below and the chunked weight pass that follows
@@ -888,6 +959,36 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                 temperature=self.temperature,
                 eps=self.eps,
             )
+        return base_weights_t
+
+    def forward(self, X, gate=1.0):
+        """
+        Run MSDE and return shifted data, movement, and trajectory.
+
+        If a reference manifold was passed at init time, every point of
+        this X is shifted with respect to neighbours found in that fixed
+        reference manifold (self.X_ref never moves). Otherwise X is
+        shifted with respect to itself, as before.
+        """
+        if not self.enable_gradients:
+            X = X.detach()
+
+        reference_mode = self.X_ref is not None
+
+        if reference_mode:
+            if X.dim() != 2 or X.shape[1] != self.X_ref.shape[1]:
+                raise ValueError(
+                    f"X passed to forward() has feature dim {tuple(X.shape[1:])}, "
+                    f"which doesn't match the reference manifold's feature dim "
+                    f"{tuple(self.X_ref.shape[1:])}. Reference-shift mode requires "
+                    f"both to live in the same feature space; point count and "
+                    f"order may still differ freely."
+                )
+            # Fixed corpus -- its density weights were already computed
+            # once at init time (see __init__), so no per-call recompute.
+            base_weights_t = self._ref_base_weights
+        else:
+            base_weights_t = self._compute_base_weights(X)
 
         n_samples = X.shape[0]
         shifted_dataset = X.clone()
@@ -913,8 +1014,9 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         # Note base_weights_t itself is NOT recomputed here even when
         # recompute_neighbors is set -- it comes from a separate, far more
         # expensive pipeline (get_empirical_weights's eps binary search over
-        # the *original* X) and is treated as a static "how typical is this
-        # point" prior. Only the neighbour topology used for the barycenter
+        # the *original* X, or over the reference manifold in reference
+        # mode) and is treated as a static "how typical is this point"
+        # prior. Only the neighbour topology used for the barycenter
         # gather/spmm is refreshed. Recomputing base_weights_t on the
         # shifted data would be possible too, but multiplies the dominant
         # cost of forward() by (max_iters_shift // N) -- do that only if you
@@ -923,7 +1025,15 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         indices_fixed = None
         w_or_W = None
 
+        # In self-shift mode, the corpus being searched/gathered from is
+        # shifted_dataset itself, so it moves every iteration. In
+        # reference-shift mode it's the fixed reference manifold, which
+        # never changes -- resolved once here rather than every iteration.
+        corpus_size = self.X_ref.shape[0] if reference_mode else n_samples
+
         for iter_count in range(self.max_iters_shift):
+            corpus_for_shift = self.X_ref if reference_mode else shifted_dataset
+
             if iter_count == 0 or (
                 self.recompute_neighbors and iter_count % self.recompute_neighbors == 0
             ):
@@ -935,7 +1045,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                     # range -- if you ever run this on datasets north of
                     # ~2^31 points, keep indices_fixed as int64 instead.
                     indices_fixed_i64 = compute_fixed_knn(
-                        shifted_dataset.detach(), self.k, device=self.device_name
+                        shifted_dataset.detach(), self.k, device=self.device_name,
+                        corpus=(self.X_ref.detach() if reference_mode else None),
                     )
                     indices_fixed = indices_fixed_i64.to(torch.int32)
 
@@ -945,7 +1056,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
 
                 if self.use_sparse_shift:
                     w_or_W = _build_sparse_weight_matrix(
-                        indices_fixed_i64, w_norm, n_samples, self.device_name
+                        indices_fixed_i64, w_norm, n_samples, corpus_size, self.device_name
                     )
                 else:
                     w_or_W = w_norm
@@ -957,6 +1068,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                 self.learning_rate,
                 self.alpha,
                 gate,
+                corpus_for_shift,
             )
 
             total_distance = total_distance + change
