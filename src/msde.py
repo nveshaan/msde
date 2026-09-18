@@ -72,6 +72,7 @@ def _sparse_mm_supported(device):
 
 
 _KNN_CHUNK_KERNEL_CACHE = {}
+_MASKED_KNN_CHUNK_KERNEL_CACHE = {}
 
 
 def _make_knn_chunk_kernel(k):
@@ -96,7 +97,46 @@ def _get_knn_chunk_kernel(k):
     return _KNN_CHUNK_KERNEL_CACHE[k]
 
 
-def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192, corpus=None):
+def _make_masked_knn_chunk_kernel(k):
+    """
+    Same-class-only k-NN chunk kernel. Deliberately NOT implemented by
+    slicing out each class's corpus rows -- that would make the corpus
+    dimension data-dependent (a different shape per class, per chunk),
+    which torch.compile(fullgraph=True) can't trace and which would blow
+    up _MASKED_KNN_CHUNK_KERNEL_CACHE with one compile per class per shape.
+    Instead the full (chunk, corpus) distance matrix is computed exactly as
+    in the unmasked kernel -- same static shape regardless of how many
+    classes there are -- and cross-class entries are set to +inf before
+    topk. Shapes never depend on label *values*, only on X_chunk/X_full's
+    sizes, so this compiles and caches exactly like the unmasked kernel.
+
+    Cost: still O(chunk * corpus) distances every call, same as unmasked --
+    masking narrows *which* entries topk can pick, not how many get
+    computed.
+
+    Starvation: if a query point has fewer than k same-class corpus points,
+    its leftover neighbour slots come back with dist == +inf and an
+    arbitrary index (whichever corpus row lost the topk tie-break at
+    +inf). Callers must not treat those slots as real neighbours -- see
+    the `valid` mask built from a label re-check in forward().
+    """
+    def _kernel(X_chunk, X_full, labels_chunk, labels_full):
+        d = torch.cdist(X_chunk, X_full)                          # (chunk, n)
+        same_class = labels_chunk.unsqueeze(1) == labels_full.unsqueeze(0)
+        d = d.masked_fill(~same_class, float("inf"))
+        return d.topk(k, largest=False, dim=1)
+    return torch.compile(_kernel, fullgraph=True)
+
+
+def _get_masked_knn_chunk_kernel(k):
+    """Cached per k, same rationale as _get_knn_chunk_kernel -- separate
+    cache/graph from the unmasked kernel since it has two extra inputs."""
+    if k not in _MASKED_KNN_CHUNK_KERNEL_CACHE:
+        _MASKED_KNN_CHUNK_KERNEL_CACHE[k] = _make_masked_knn_chunk_kernel(k)
+    return _MASKED_KNN_CHUNK_KERNEL_CACHE[k]
+
+
+def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192, corpus=None, labels=None, corpus_labels=None):
     """
     Exact brute-force k-NN on GPU via chunked cdist + topk.
     Maintains autograd flow for distances if X requires_grad.
@@ -109,6 +149,17 @@ def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192, corpus=None):
         searched for its k nearest neighbours *within `corpus`* instead of
         within X itself (cross k-NN against a fixed reference set). When
         omitted, behaviour is unchanged: X is searched against itself.
+
+    labels, corpus_labels : optional 1D integer tensors (same class
+        encoding). When `labels` is given, search is restricted per-class:
+        point i can only match corpus points j with
+        corpus_labels[j] == labels[i]. `corpus_labels` defaults to `labels`
+        when `corpus` is None (self-search -- X is its own corpus, so they
+        share one label array); it's required when `corpus` is given
+        (cross-search -- there is no reason corpus's labels equal X's).
+        A query point with fewer than k same-class corpus points gets
+        float('inf')-distance, indeterminate-index slots for the shortfall
+        -- see _make_masked_knn_chunk_kernel's docstring.
     
     Returns
     -------
@@ -117,17 +168,36 @@ def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192, corpus=None):
     knn_dists   : FloatTensor (n, k) on device
     """
     X_full = corpus if corpus is not None else X
+
+    if labels is not None:
+        if corpus is None:
+            full_labels = corpus_labels if corpus_labels is not None else labels
+        elif corpus_labels is not None:
+            full_labels = corpus_labels
+        else:
+            raise ValueError(
+                "corpus_labels must be given alongside labels when corpus is also given "
+                "(cross-manifold masked k-NN) -- there's no default correspondence between "
+                "X's labels and corpus's labels."
+            )
+        chunk_kernel = _get_masked_knn_chunk_kernel(k)
+    else:
+        full_labels = None
+        chunk_kernel = _get_knn_chunk_kernel(k)
+
     n = X.shape[0]
     all_idx = torch.empty((n, k), dtype=torch.long, device=device)
     
     # Store dists in a list and cat them to preserve autograd graph 
     # (inplace assignments on requires_grad tensors throw errors)
     all_dist_list = []
-    chunk_kernel = _get_knn_chunk_kernel(k)
 
     for start in range(0, n, chunk_size):
         end = min(n, start + chunk_size)
-        dists, idx = chunk_kernel(X[start:end], X_full)
+        if labels is not None:
+            dists, idx = chunk_kernel(X[start:end], X_full, labels[start:end], full_labels)
+        else:
+            dists, idx = chunk_kernel(X[start:end], X_full)
         all_idx[start:end] = idx
         all_dist_list.append(dists)
 
@@ -135,8 +205,11 @@ def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192, corpus=None):
     return all_idx, all_dist
 
 
-def compute_fixed_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096, corpus=None):
-    indices, _ = torch_knn(X, k, device=device, chunk_size=chunk_size, corpus=corpus)
+def compute_fixed_knn(X, k, device=DEFAULT_DEVICE, chunk_size=4096, corpus=None, labels=None, corpus_labels=None):
+    indices, _ = torch_knn(
+        X, k, device=device, chunk_size=chunk_size, corpus=corpus,
+        labels=labels, corpus_labels=corpus_labels,
+    )
     return indices
 
 
@@ -781,6 +854,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         low_precision_barycenter=False,
         recompute_neighbors=0,
         X=None,
+        labels=None,
     ):
         """
         X : optional (m, d) tensor -- a fixed reference manifold. When
@@ -790,6 +864,16 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             which stays fixed for the lifetime of the module. When omitted
             (default), forward() behaves as before -- each call's X is
             shifted with respect to itself.
+        labels : optional (m,) integer tensor/array-like, aligned with X.
+            Class labels for the reference manifold. When given (requires
+            X to also be given here), forward() restricts neighbour search
+            to same-class points for any call where forward() is also
+            given labels: a point of forward()'s input can only be shifted
+            towards reference points sharing its label (forward()'s
+            labels are optional per-call -- see forward()'s docstring).
+            Can also be set or changed later via
+            set_reference_manifold(X_ref_or_None, labels=...) without
+            passing X here.
         """
         super().__init__()
 
@@ -864,14 +948,29 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         # every future forward(X_new) shifts X_new against, instead of
         # X_new shifting against itself. See set_reference_manifold() for
         # updating/clearing it after construction.
-        self.set_reference_manifold(X)
+        self.set_reference_manifold(X, labels=labels)
 
         _configure_logging(log_file)
 
-    def set_reference_manifold(self, X):
+    def _set_ref_labels(self, labels, n_ref):
+        """Validate and (re)register self._ref_labels. `labels=None` clears it."""
+        if labels is not None:
+            ref_labels = torch.as_tensor(labels, device=self.device_name).detach().long()
+            if ref_labels.dim() != 1 or ref_labels.shape[0] != n_ref:
+                raise ValueError(
+                    f"labels must be 1D with length matching the reference manifold "
+                    f"(n_ref={n_ref}); got shape {tuple(ref_labels.shape)}"
+                )
+            self._buffers.pop("_ref_labels", None)
+            self.register_buffer("_ref_labels", ref_labels)
+        else:
+            self._buffers.pop("_ref_labels", None)
+            self.register_buffer("_ref_labels", None)
+
+    def set_reference_manifold(self, X, labels=None):
         """
-        Set, replace, or clear the fixed reference manifold used by
-        forward() -- outside of and after __init__.
+        Set, replace, clear, or (re)label the fixed reference manifold used
+        by forward() -- outside of and after __init__.
 
         X : (n_ref, d) tensor/array-like, or None.
             If not None, becomes the new self.X_ref: forward()'s future
@@ -881,9 +980,21 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             per forward() call, since the manifold is fixed until this
             method is called again. Stored detached/no-grad -- it's meant
             as fixed reference data, not something trained via forward()'s
-            gradients.
-            If None, clears any existing reference manifold: forward()
-            reverts to shifting its input against itself.
+            gradients. `labels` is applied alongside it (see below).
+            If None and `labels` is also None, clears any existing
+            reference manifold (and any stored labels): forward() reverts
+            to shifting its input against itself.
+            If None but `labels` is given, X_ref itself is left exactly as
+            it is (no recompute of X_ref or its base weights) -- only its
+            labels are set/replaced. This requires a reference manifold to
+            already be set; call set_reference_manifold(X, labels=...)
+            (or pass X at __init__) first if not.
+        labels : optional (n_ref,) integer tensor/array-like, aligned with
+            X (or with the existing self.X_ref, if X is None here). When
+            given, forward() restricts neighbour search to same-class
+            points -- see forward()'s docstring. Pass labels=None
+            (default) to leave existing labels alone when X is given, or
+            to clear everything when X is also None.
         """
         if X is not None:
             X_ref = torch.as_tensor(X, device=self.device_name).detach()
@@ -895,9 +1006,19 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             self.register_buffer("X_ref", X_ref)
             with torch.no_grad():
                 self._ref_base_weights = self._compute_base_weights(self.X_ref).detach()
+            self._set_ref_labels(labels, X_ref.shape[0])
+        elif labels is not None:
+            if getattr(self, "X_ref", None) is None:
+                raise ValueError(
+                    "set_reference_manifold(X=None, labels=...) updates labels on an "
+                    "existing reference manifold, but none is set. Call "
+                    "set_reference_manifold(X, labels=...) (or pass X at __init__) first."
+                )
+            self._set_ref_labels(labels, self.X_ref.shape[0])
         else:
             self._buffers.pop("X_ref", None)
             self.register_buffer("X_ref", None)
+            self._set_ref_labels(None, 0)
             self._ref_base_weights = None
 
     def _compute_base_weights(self, X):
@@ -961,19 +1082,42 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             )
         return base_weights_t
 
-    def forward(self, X, gate=1.0):
+    def forward(self, X, gate=1.0, labels=None):
         """
         Run MSDE and return shifted data, movement, and trajectory.
 
-        If a reference manifold was passed at init time, every point of
-        this X is shifted with respect to neighbours found in that fixed
-        reference manifold (self.X_ref never moves). Otherwise X is
-        shifted with respect to itself, as before.
+        If a reference manifold was passed at init time (or via
+        set_reference_manifold()), every point of this X is shifted with
+        respect to neighbours found in that fixed reference manifold
+        (self.X_ref never moves). Otherwise X is shifted with respect to
+        itself, as before.
+
+        labels : optional (n,) integer tensor/array-like, aligned with X.
+            Class labels for this call's X. When given, neighbour search
+            is restricted per-class -- each point can only be shifted
+            towards same-class neighbours (found in self.X_ref if a
+            reference manifold is set, otherwise in X itself).
+            - Self-shift mode: pass labels here only; per-point classes
+              are compared against each other within X.
+            - Reference-shift mode: if the reference manifold has labels
+              (set via the `labels=` argument to __init__ or
+              set_reference_manifold()), passing labels here is optional
+              -- omit them to do an unmasked (all-classes) shift for this
+              call even though the reference is labelled, or pass them to
+              mask per-class as usual. If the reference manifold does NOT
+              have labels, passing labels here is an error: there is
+              nothing on the reference side to mask against.
+            A point with fewer than k same-class neighbours available
+            simply gets fewer effective neighbours (the rest contribute
+            zero weight); a point with *no* same-class neighbours at all
+            is left unmoved for that call (no valid direction to shift
+            it in) rather than shifted towards a meaningless barycenter.
         """
         if not self.enable_gradients:
             X = X.detach()
 
         reference_mode = self.X_ref is not None
+        ref_labels = self._ref_labels if reference_mode else None
 
         if reference_mode:
             if X.dim() != 2 or X.shape[1] != self.X_ref.shape[1]:
@@ -989,6 +1133,24 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             base_weights_t = self._ref_base_weights
         else:
             base_weights_t = self._compute_base_weights(X)
+
+        if labels is not None and reference_mode and ref_labels is None:
+            raise ValueError(
+                "labels was passed to forward(), but the reference manifold has no "
+                "labels (none were given to __init__ or set_reference_manifold()). "
+                "There's nothing on the reference side to mask against -- either call "
+                "set_reference_manifold(self.X_ref, labels=...) to label the reference "
+                "manifold, or drop labels= from this forward() call."
+            )
+
+        masked = labels is not None
+        if masked:
+            labels = torch.as_tensor(labels, device=self.device_name).detach().long()
+            if labels.dim() != 1 or labels.shape[0] != X.shape[0]:
+                raise ValueError(
+                    f"labels must be 1D with length matching X (n={X.shape[0]}); "
+                    f"got shape {tuple(labels.shape)}"
+                )
 
         n_samples = X.shape[0]
         shifted_dataset = X.clone()
@@ -1024,12 +1186,14 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         # shift, not just the neighbour set.
         indices_fixed = None
         w_or_W = None
+        orphan_mask = None    # (n,) bool -- points with zero same-class neighbours this recompute
 
         # In self-shift mode, the corpus being searched/gathered from is
         # shifted_dataset itself, so it moves every iteration. In
         # reference-shift mode it's the fixed reference manifold, which
         # never changes -- resolved once here rather than every iteration.
         corpus_size = self.X_ref.shape[0] if reference_mode else n_samples
+        corpus_labels = ref_labels if reference_mode else labels   # self mode: corpus IS X, so its labels are `labels`
 
         for iter_count in range(self.max_iters_shift):
             corpus_for_shift = self.X_ref if reference_mode else shifted_dataset
@@ -1044,13 +1208,37 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                     # Safe given n <= ~100k always fits comfortably in int32's
                     # range -- if you ever run this on datasets north of
                     # ~2^31 points, keep indices_fixed as int64 instead.
+                    knn_kwargs = {}
+                    if masked:
+                        knn_kwargs["labels"] = labels
+                        if reference_mode:
+                            knn_kwargs["corpus_labels"] = corpus_labels
+                        # self mode: corpus_labels defaults to `labels` inside torch_knn
+
                     indices_fixed_i64 = compute_fixed_knn(
                         shifted_dataset.detach(), self.k, device=self.device_name,
                         corpus=(self.X_ref.detach() if reference_mode else None),
+                        **knn_kwargs,
                     )
                     indices_fixed = indices_fixed_i64.to(torch.int32)
 
                 w = base_weights_t[indices_fixed_i64]                        # (n, k)
+
+                if masked:
+                    # Same-class check re-derived from labels rather than
+                    # threaded through as a separate return value from
+                    # compute_fixed_knn -- cheap (one gather + compare) and
+                    # keeps compute_fixed_knn's return signature unchanged.
+                    # Zeroes weight on any slot that's cross-class (real
+                    # corpus point, wrong label) or a starvation
+                    # placeholder (+inf-distance, indeterminate index).
+                    valid = corpus_labels[indices_fixed_i64] == labels.unsqueeze(1)   # (n, k) bool
+                    w = w * valid
+                    has_any_valid = valid.any(dim=1)                          # (n,)
+                    orphan_mask = ~has_any_valid
+                else:
+                    orphan_mask = None
+
                 denom = w.sum(dim=1, keepdim=True).clamp_min(1e-6)           # (n, 1)
                 w_norm = w / denom                                           # fold the divide in once, not per iteration
 
@@ -1070,6 +1258,14 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                 gate,
                 corpus_for_shift,
             )
+
+            if orphan_mask is not None and orphan_mask.any():
+                # No same-class neighbours at all this recompute -- w_norm's
+                # row is all-zero, which would otherwise pull the point
+                # towards a zero/garbage barycenter. Leave these points
+                # exactly where they are instead.
+                revised_d = torch.where(orphan_mask.unsqueeze(1), shifted_dataset, revised_d)
+                change = torch.where(orphan_mask, torch.zeros_like(change), change)
 
             total_distance = total_distance + change
             shifted_dataset = revised_d
