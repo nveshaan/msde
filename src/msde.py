@@ -1,5 +1,7 @@
 import logging
+
 import torch
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
@@ -22,11 +24,7 @@ def _prepare_scalar(value, name, device, dtype, learnable):
     return scalar
 
 def _configure_logging(log_file):
-    """
-    Route all logging from this module to `log_file` only.
-    If log_file is None, logging is disabled entirely (no console output).
-    Safe to call repeatedly (e.g. on every top-level entry point call).
-    """
+    """Configure this module's file-only logger."""
     for h in list(logger.handlers):
         logger.removeHandler(h)
         h.close()
@@ -48,15 +46,7 @@ def _configure_logging(log_file):
 _SPARSE_MM_SUPPORT_CACHE = {}
 
 def _sparse_mm_supported(device):
-    """
-    Sparse-op support probe (cached per device string)
-    
-    torch.sparse_coo_tensor / torch.sparse.mm historically raised
-    NotImplementedError on the MPS backend; support has landed on some
-    recent builds but isn't guaranteed for every torch/macOS combination.
-    Probe once per device, cache the result, and let callers fall back to
-    the dense gather-based path instead of hard-crashing.
-    """
+    """Return whether sparse matrix multiplication works on ``device``."""
     if device in _SPARSE_MM_SUPPORT_CACHE:
         return _SPARSE_MM_SUPPORT_CACHE[device]
     try:
@@ -83,43 +73,14 @@ def _make_knn_chunk_kernel(k):
 
 
 def _get_knn_chunk_kernel(k):
-    """
-    Cached per k (closure constant -- topk's k must be a compile-time
-    constant). torch_knn is called with the same k repeatedly (k=self.k for
-    the shift graph, k=15 for the fuzzy-similarity graph), so this is a
-    compile-once-reuse-many-forward()-calls win. The trailing, possibly
-    undersized chunk (when n isn't a multiple of chunk_size) triggers one
-    extra recompile for that distinct shape the first time it's seen, then
-    is cached same as any other shape.
-    """
+    """Return the compiled unmasked k-NN kernel for ``k``."""
     if k not in _KNN_CHUNK_KERNEL_CACHE:
         _KNN_CHUNK_KERNEL_CACHE[k] = _make_knn_chunk_kernel(k)
     return _KNN_CHUNK_KERNEL_CACHE[k]
 
 
 def _make_masked_knn_chunk_kernel(k):
-    """
-    Same-class-only k-NN chunk kernel. Deliberately NOT implemented by
-    slicing out each class's corpus rows -- that would make the corpus
-    dimension data-dependent (a different shape per class, per chunk),
-    which torch.compile(fullgraph=True) can't trace and which would blow
-    up _MASKED_KNN_CHUNK_KERNEL_CACHE with one compile per class per shape.
-    Instead the full (chunk, corpus) distance matrix is computed exactly as
-    in the unmasked kernel -- same static shape regardless of how many
-    classes there are -- and cross-class entries are set to +inf before
-    topk. Shapes never depend on label *values*, only on X_chunk/X_full's
-    sizes, so this compiles and caches exactly like the unmasked kernel.
-
-    Cost: still O(chunk * corpus) distances every call, same as unmasked --
-    masking narrows *which* entries topk can pick, not how many get
-    computed.
-
-    Starvation: if a query point has fewer than k same-class corpus points,
-    its leftover neighbour slots come back with dist == +inf and an
-    arbitrary index (whichever corpus row lost the topk tie-break at
-    +inf). Callers must not treat those slots as real neighbours -- see
-    the `valid` mask built from a label re-check in forward().
-    """
+    """Return a compiled k-NN kernel that masks cross-class distances."""
     def _kernel(X_chunk, X_full, labels_chunk, labels_full):
         d = torch.cdist(X_chunk, X_full)                          # (chunk, n)
         same_class = labels_chunk.unsqueeze(1) == labels_full.unsqueeze(0)
@@ -129,44 +90,26 @@ def _make_masked_knn_chunk_kernel(k):
 
 
 def _get_masked_knn_chunk_kernel(k):
-    """Cached per k, same rationale as _get_knn_chunk_kernel -- separate
-    cache/graph from the unmasked kernel since it has two extra inputs."""
+    """Return the cached masked k-NN kernel for ``k``."""
     if k not in _MASKED_KNN_CHUNK_KERNEL_CACHE:
         _MASKED_KNN_CHUNK_KERNEL_CACHE[k] = _make_masked_knn_chunk_kernel(k)
     return _MASKED_KNN_CHUNK_KERNEL_CACHE[k]
 
 
+def _make_soft_topk_weight_kernel():
+    def _kernel(X, corpus, indices, temperature):
+        sel = corpus[indices]                                    # (n, k, d)
+        d_selected = (X.unsqueeze(1) - sel).norm(dim=-1)          # (n, k)
+        boundary = d_selected.max(dim=1, keepdim=True).values     # (n, 1) -- the k-th neighbour's distance
+        return torch.sigmoid((boundary - d_selected) / temperature)
+    return torch.compile(_kernel, fullgraph=True)
+
+
+_SOFT_TOPK_WEIGHT_KERNEL = _make_soft_topk_weight_kernel()
+
+
 def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192, corpus=None, labels=None, corpus_labels=None):
-    """
-    Exact brute-force k-NN on GPU via chunked cdist + topk.
-    Maintains autograd flow for distances if X requires_grad.
-    
-    MEMORY NOTE: This does NOT "batch" the dataset mathematically. Every point
-    finds its true neighbors across the *entire* dataset X (O(N) search space). 
-    chunk_size merely streams the outer loop to bound peak VRAM to O(chunk_size * N).
-
-    corpus : optional (m, d) tensor. When given, every point in X is
-        searched for its k nearest neighbours *within `corpus`* instead of
-        within X itself (cross k-NN against a fixed reference set). When
-        omitted, behaviour is unchanged: X is searched against itself.
-
-    labels, corpus_labels : optional 1D integer tensors (same class
-        encoding). When `labels` is given, search is restricted per-class:
-        point i can only match corpus points j with
-        corpus_labels[j] == labels[i]. `corpus_labels` defaults to `labels`
-        when `corpus` is None (self-search -- X is its own corpus, so they
-        share one label array); it's required when `corpus` is given
-        (cross-search -- there is no reason corpus's labels equal X's).
-        A query point with fewer than k same-class corpus points gets
-        float('inf')-distance, indeterminate-index slots for the shortfall
-        -- see _make_masked_knn_chunk_kernel's docstring.
-    
-    Returns
-    -------
-    knn_indices : LongTensor (n, k) on device -- indices into `corpus` if
-        given, otherwise into X.
-    knn_dists   : FloatTensor (n, k) on device
-    """
+    """Compute exact chunked k-NN indices and distances."""
     X_full = corpus if corpus is not None else X
 
     if labels is not None:
@@ -222,7 +165,6 @@ def _make_symmetrize_kernel():
         cols = knn_indices.reshape(-1)
         vals = weights.reshape(-1)
 
-        # Symmetrize on GPU (Autograd safe through fancy indexing)
         fwd_keys = rows * n + cols
         rev_keys = cols * n + rows
 
@@ -241,24 +183,21 @@ def _make_symmetrize_kernel():
     return torch.compile(_kernel, fullgraph=True)
 
 
-# Single config (no branching on any Python constant), so one instance
-# suffices -- built once at import time.
 _SYMMETRIZE_KERNEL = _make_symmetrize_kernel()
 
 
+_SOFT_PRUNE_MARGIN_SIGMAS = 6.0
+
+
 def fuzzy_simplicial_set_torch(knn_indices, knn_dists, n, n_neighbors, n_epochs=200,
-                                device=DEFAULT_DEVICE):
-    """
-    GPU port of UMAP's smooth-knn-dist construction.
-    Modified to ensure gradients can flow back through knn_dists.
-    """
+                                device=DEFAULT_DEVICE, soft_prune=False,
+                                soft_prune_temperature=None):
+    """Build a sparse fuzzy graph from k-NN results."""
+    if soft_prune and soft_prune_temperature is None:
+        raise ValueError("soft_prune=True requires soft_prune_temperature")
     k = n_neighbors
     target = float(torch.log2(torch.tensor(k, dtype=torch.float32)))
 
-    # Compute binary search targets (rho and sigma) WITHOUT tracking gradients
-    # so we don't build a massive, unstable autograd graph inside the loop.
-    # NOT compiled: inherently sequential (each step depends on the last)
-    # and syncs via bool(...) every iteration -- compile can't remove that.
     with torch.no_grad():
         mask = knn_dists > 0
         rhos_ng = torch.where(mask, knn_dists, torch.tensor(float("inf"), device=device))
@@ -291,44 +230,32 @@ def fuzzy_simplicial_set_torch(knn_indices, knn_dists, n, n_neighbors, n_epochs=
             if bool(converged.all()):
                 break
 
-    # Now back in autograd land, recompute the actual weights using the fixed 
-    # rho and sigma constants, allowing gradients to flow to knn_dists and thus X.
-    # Compiled: fixed-shape dense ops all the way through symmetrization.
     rhos = rhos_ng.detach()
     sigma = torch.clamp(sigma_ng.detach(), min=1e-10)
 
     rows, cols, w_sym = _SYMMETRIZE_KERNEL(knn_dists, knn_indices, rhos, sigma, n, k)
 
-    # NOT compiled: nonzero()'s output size is data-dependent, which
-    # fullgraph=True compilation can't handle as a fixed-shape graph.
     threshold = w_sym.max() / max(n_epochs, 1)
-    active = torch.nonzero(w_sym >= threshold, as_tuple=True)[0]
 
+    if soft_prune:
+        keep_threshold = threshold.detach() - _SOFT_PRUNE_MARGIN_SIGMAS * soft_prune_temperature
+        active = torch.nonzero(w_sym.detach() >= keep_threshold, as_tuple=True)[0]
+        gate = torch.sigmoid((w_sym - threshold) / soft_prune_temperature)
+        w_gated = w_sym * gate
+        return rows[active], cols[active], w_gated[active]
+
+    active = torch.nonzero(w_sym >= threshold, as_tuple=True)[0]
     return rows[active], cols[active], w_sym[active]
 
 
-# ---------------------------------------------------------------------------
-# Empirical weight computation
-#
-# The algorithm runs on the *entire* dataset as a single logical batch --
-# every point is compared against every other point, exactly like an
-# unbounded-memory O(n^2) implementation would. What's bounded is memory,
-# not the input: the similarity graph is stored sparse (only the ~n*k
-# nonzero edges, not a dense n x n matrix), and the O(n^2) pairwise-distance
-# work needed for the eps radius search is streamed in row-chunks (a la
-# `torch_knn`'s cdist chunking) so peak memory is O(chunk_size * n) instead
-# of O(n^2). The binary search for eps is inherently sequential (each step's
-# bounds depend on the previous step's result), so it stays a scalar
-# Python-level loop -- but each step's condition check is itself chunked.
-# ---------------------------------------------------------------------------
-
-def _build_sparse_similarity(X, n_neighbors, n_epochs, device):
-    """Fuzzy simplicial set stored as a sparse (n, n) COO tensor (~n*k
-    nonzeros) instead of a dense matrix."""
+def _build_sparse_similarity(X, n_neighbors, n_epochs, device, soft_prune=False,
+                              soft_prune_temperature=None):
+    """Build the sparse fuzzy similarity graph used for density weights."""
     n = X.shape[0]
     knn_idx, knn_dist = torch_knn(X, n_neighbors, device=device)
     rows, cols, vals = fuzzy_simplicial_set_torch(
-        knn_idx, knn_dist, n, n_neighbors, n_epochs, device
+        knn_idx, knn_dist, n, n_neighbors, n_epochs, device,
+        soft_prune=soft_prune, soft_prune_temperature=soft_prune_temperature,
     )
     return torch.sparse_coo_tensor(
         torch.stack([rows, cols]), vals, size=(n, n), device=device,
@@ -337,12 +264,7 @@ def _build_sparse_similarity(X, n_neighbors, n_epochs, device):
 
 
 def _sparse_similarity_layout(S):
-    """
-    Precompute a CSR-like layout (sorted rows/cols/vals + row offset
-    pointers) once, so every chunked pass below can slice an arbitrary
-    row-range via plain Python indexing (`row_ptr[start:end]`) instead of
-    re-running `torch.searchsorted` (and a GPU sync) on every chunk.
-    """
+    """Prepare row offsets and squared norms for streamed graph passes."""
     idx = S.indices()
     rows_sorted, cols_sorted, vals_sorted = idx[0], idx[1], S.values()
     n = S.shape[0]
@@ -361,27 +283,11 @@ def _make_pairwise_dist_from_cross():
     return torch.compile(_kernel, fullgraph=True)
 
 
-# Single config, device/shape-agnostic (torch.compile guards+recompiles per
-# shape internally) -- built once at import time.
 _PAIRWISE_DIST_KERNEL = _make_pairwise_dist_from_cross()
 
 
 def _chunk_pairwise_dist(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, start, end):
-    """
-    Distances from every point (n) to the points in row-range [start, end),
-    computed without ever materializing a dense (n, n) matrix:
-    dense-ify just this row chunk from the sparse graph, get dot products
-    against all n rows via one sparse @ dense matmul, then finish with
-    ||a-b||^2 = ||a||^2 + ||b||^2 - 2<a,b>.
-    Returns dist (n, chunk) and idx (chunk,) -- the absolute row indices.
-
-    The sparse.mm stays eager (torch.compile can't wrap a sparse-tensor
-    argument, same limitation as the shift kernel's spmm); only the
-    dense distance-finishing math after it is compiled. This function is
-    called up to ~50x per eps binary-search call, per chunk, so the
-    compiled part gets reused heavily across a single forward() and across
-    the many forward() calls in a bench loop.
-    """
+    """Compute distances to one graph-row chunk."""
     n = S.shape[0]
     device = S.device
     lo, hi = row_ptr[start], row_ptr[end]
@@ -390,8 +296,7 @@ def _chunk_pairwise_dist(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_
     chunk_dense = torch.zeros((c, n), dtype=row_norm_sq.dtype, device=device)
     chunk_dense[rows_sorted[lo:hi] - start, cols_sorted[lo:hi]] = vals_sorted[lo:hi]
 
-    # Matrix multiply guarantees we compute similarity against ALL `N` points
-    cross = torch.sparse.mm(S, chunk_dense.T)                 # eager
+    cross = torch.sparse.mm(S, chunk_dense.T)
     idx = torch.arange(start, end, device=device)
     dist = _PAIRWISE_DIST_KERNEL(row_norm_sq, idx, cross)      # compiled
     return dist, idx
@@ -399,12 +304,7 @@ def _chunk_pairwise_dist(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_
 
 def radius_counts_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
                           eps_tensor, chunk_size, temperature=None):
-    """
-    Count neighbours within radius `eps` for every point. Every point is
-    still compared against every other point (same result as a full
-    O(n^2) computation); only the peak memory is bounded, to
-    O(chunk_size * n), by streaming over row-chunks.
-    """
+    """Count graph-space neighbors within ``eps`` using row chunks."""
     n = S.shape[0]
     counts = torch.zeros(n, dtype=torch.float32, device=S.device)
     for start in range(0, n, chunk_size):
@@ -422,8 +322,7 @@ def radius_counts_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row
 
 
 def _min_max_dist_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, chunk_size):
-    """Global max/min pairwise distance (excluding self-pairs), streamed
-    over row-chunks -- seeds the binary search bounds."""
+    """Return global non-self minimum and maximum graph distances."""
     n = S.shape[0]
     device = S.device
     running_max = torch.tensor(float("-inf"), device=device)
@@ -442,19 +341,12 @@ def _min_max_dist_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row
 
 def _binary_search_eps_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
                                low, high, threshold, required, chunk_size, tol=1e-4, max_iter=50):
-    """
-    Scalar binary search for the smallest eps satisfying the density
-    condition -- inherently sequential (each step's bounds depend on the
-    previous step), same as the original. Each condition check runs
-    chunked, so the search stays within a fixed memory budget regardless
-    of n, and gives the exact same eps a full O(n^2) search would.
-    """
+    """Find the smallest radius satisfying the density condition."""
     lo, hi = low, high
     result = high
     found = False
     for _ in range(max_iter):
         mid = (lo + hi) / 2.0
-        # Hard count needed during search
         counts = radius_counts_chunked(
             S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, torch.tensor(mid, device=S.device), chunk_size
         )
@@ -468,17 +360,97 @@ def _binary_search_eps_chunked(S, rows_sorted, cols_sorted, vals_sorted, row_ptr
     return result, found
 
 
+class _ImplicitEpsFn(torch.autograd.Function):
+    """Differentiate the epsilon selected by the chunked search implicitly."""
+
+    @staticmethod
+    def forward(ctx, vals_sorted, rows_sorted, cols_sorted, row_ptr, n,
+                threshold, required, chunk_size, count_temperature,
+                threshold_temperature, min_dist, max_dist):
+        device = vals_sorted.device
+        with torch.no_grad():
+            vals_d = vals_sorted.detach()
+            row_norm_sq = torch.zeros(n, dtype=torch.float32, device=device)
+            row_norm_sq.scatter_add_(0, rows_sorted, vals_d ** 2)
+            S_hard = torch.sparse_coo_tensor(
+                torch.stack([rows_sorted, cols_sorted]), vals_d, size=(n, n),
+                device=device, check_invariants=False,
+            ).coalesce()
+
+            used_threshold, used_required = threshold, required
+            eps_value, found = _binary_search_eps_chunked(
+                S_hard, rows_sorted, cols_sorted, vals_d, row_ptr, row_norm_sq,
+                min_dist, max_dist, used_threshold, used_required, chunk_size,
+            )
+            if not found:
+                used_threshold = max(1, threshold // 2)
+                used_required = required // 2
+                eps_value, found = _binary_search_eps_chunked(
+                    S_hard, rows_sorted, cols_sorted, vals_d, row_ptr, row_norm_sq,
+                    min_dist, max_dist, used_threshold, used_required, chunk_size,
+                )
+            if not found:
+                eps_value = max_dist
+
+        eps_star = torch.tensor(eps_value, dtype=vals_sorted.dtype, device=device)
+
+        ctx.save_for_backward(vals_sorted, rows_sorted, cols_sorted, eps_star)
+        ctx.row_ptr = row_ptr
+        ctx.n = n
+        ctx.chunk_size = chunk_size
+        ctx.count_temperature = count_temperature
+        ctx.threshold_temperature = threshold_temperature
+        ctx.used_threshold = used_threshold
+        ctx.used_required = used_required
+        ctx.converged = found
+        return eps_star
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        vals_sorted, rows_sorted, cols_sorted, eps_star = ctx.saved_tensors
+
+        if not ctx.converged:
+            return (torch.zeros_like(vals_sorted),
+                    None, None, None, None, None, None, None, None, None, None, None)
+
+        n = ctx.n
+        with torch.enable_grad():
+            vals_ = vals_sorted.detach().requires_grad_(True)
+            eps_ = eps_star.detach().requires_grad_(True)
+            row_norm_sq = torch.zeros(n, dtype=torch.float32, device=vals_.device)
+            row_norm_sq.scatter_add_(0, rows_sorted, vals_ ** 2)
+            S_soft = torch.sparse_coo_tensor(
+                torch.stack([rows_sorted, cols_sorted]), vals_, size=(n, n),
+                device=vals_.device, check_invariants=False,
+            ).coalesce()
+            counts = radius_counts_chunked(
+                S_soft, rows_sorted, cols_sorted, vals_, ctx.row_ptr, row_norm_sq,
+                eps_, ctx.chunk_size, temperature=ctx.count_temperature,
+            )
+            residual = (
+                torch.sigmoid((counts - ctx.used_threshold) / ctx.threshold_temperature).sum()
+                - ctx.used_required
+            )
+            dR_deps, dR_dvals = torch.autograd.grad(residual, (eps_, vals_))
+
+        # Guard against a near-zero denominator (flat residual w.r.t. eps)
+        # without flipping its sign.
+        eps_floor = 1e-8
+        sign = torch.where(dR_deps >= 0, 1.0, -1.0)
+        dR_deps_safe = torch.where(dR_deps.abs() < eps_floor, sign * eps_floor, dR_deps)
+
+        d_eps_d_vals = -dR_dvals / dR_deps_safe          # implicit function theorem
+        grad_vals = grad_output * d_eps_d_vals
+
+        return (grad_vals, None, None, None, None, None, None, None, None, None, None, None)
+
+
 def _calculate_eps_from_similarity(S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
                                    n, nbd_sample_count_threshold,
-                                   satisfiability_proportion, chunk_size):
-    """
-    Takes the sparse-similarity layout (rows_sorted, cols_sorted,
-    vals_sorted, row_ptr, row_norm_sq) as input instead of rebuilding it
-    via _sparse_similarity_layout -- callers that already have the layout
-    (compute_weights_from_similarity_chunked, MeanShiftDensityEnhancement's
-    learn_eps branch in forward()) no longer pay for a second
-    searchsorted + scatter_add pass over the whole graph just to get eps.
-    """
+                                   satisfiability_proportion, chunk_size,
+                                   differentiable=False, count_temperature=None,
+                                   threshold_temperature=None):
+    """Calculate epsilon from a prepared sparse similarity layout."""
     max_dist, min_dist = _min_max_dist_chunked(
         S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq, chunk_size
     )
@@ -488,6 +460,18 @@ def _calculate_eps_from_similarity(S, rows_sorted, cols_sorted, vals_sorted, row
         else nbd_sample_count_threshold
     )
     required = int(satisfiability_proportion * n)
+
+    if differentiable:
+        if count_temperature is None or threshold_temperature is None:
+            raise ValueError(
+                "differentiable=True requires both count_temperature and "
+                "threshold_temperature"
+            )
+        return _ImplicitEpsFn.apply(
+            vals_sorted, rows_sorted, cols_sorted, row_ptr, n,
+            threshold, required, chunk_size,
+            count_temperature, threshold_temperature, min_dist, max_dist,
+        )
 
     eps_value, found = _binary_search_eps_chunked(
         S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
@@ -509,23 +493,30 @@ def _calculate_eps_from_similarity(S, rows_sorted, cols_sorted, vals_sorted, row
 
 def compute_weights_from_similarity_chunked(S, n, nbd_sample_count_threshold,
                                             satisfiability_proportion, max_iters_weight_count,
-                                            chunk_size, temperature=None, eps=None, layout=None):
-    """
-    Chunked (memory-bounded, exact) replacement for the original dense
-    per-batch weight computation. Operates on the entire similarity graph
-    `S` as a single logical batch.
-    """
+                                            chunk_size, temperature=None, eps=None, layout=None,
+                                            differentiable_eps=False, eps_count_temperature=None,
+                                            eps_threshold_temperature=None):
+    """Compute empirical weights with streamed graph-distance passes."""
     if layout is None:
         layout = _sparse_similarity_layout(S)
     rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq = layout
 
     if eps is None:
-        with torch.no_grad():
+        if differentiable_eps:
             eps_tensor = _calculate_eps_from_similarity(
                 S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
                 n, nbd_sample_count_threshold,
                 satisfiability_proportion, chunk_size,
+                differentiable=True, count_temperature=eps_count_temperature,
+                threshold_temperature=eps_threshold_temperature,
             )
+        else:
+            with torch.no_grad():
+                eps_tensor = _calculate_eps_from_similarity(
+                    S, rows_sorted, cols_sorted, vals_sorted, row_ptr, row_norm_sq,
+                    n, nbd_sample_count_threshold,
+                    satisfiability_proportion, chunk_size,
+                )
     else:
         eps_tensor = eps
 
@@ -555,11 +546,7 @@ def _make_dense_weight_step(has_temperature):
 
 
 def _get_dense_weight_step(has_temperature):
-    """
-    Cached per has_temperature (a fixed, per-model-instance setting) --
-    baked as a closure constant rather than passed as a runtime arg so the
-    `if` never appears inside the compiled graph.
-    """
+    """Return the cached compiled dense weight step."""
     if has_temperature not in _DENSE_WEIGHT_STEP_CACHE:
         _DENSE_WEIGHT_STEP_CACHE[has_temperature] = _make_dense_weight_step(has_temperature)
     return _DENSE_WEIGHT_STEP_CACHE[has_temperature]
@@ -568,11 +555,7 @@ def _get_dense_weight_step(has_temperature):
 def compute_weights_from_similarity_dense(S, n, nbd_sample_count_threshold,
                                           satisfiability_proportion, max_iters_weight_count,
                                           temperature=None, eps=None):
-    """
-    Unbatched (memory-heavy but fast) empirical weight computation.
-    Prioritizes O(1) ops via huge dense matrices, bypassing chunking.
-    Used when use_chunking=False. Peak VRAM footprint is O(N^2).
-    """
+    """Compute empirical weights with dense pairwise distances."""
     S_dense = S.to_dense()
     dist = torch.cdist(S_dense, S_dense)
 
@@ -646,15 +629,33 @@ def get_empirical_weights(
     use_chunking=True,
     chunk_size=2048,
     temperature=None,
-    eps=None
+    eps=None,
+    soft_prune=False,
+    soft_prune_temperature=None,
+    differentiable_eps=False,
+    eps_count_temperature=None,
+    eps_threshold_temperature=None,
 ):
     n = X.shape[0]
-    S = _build_sparse_similarity(X, n_neighbors, n_epochs, device)
+    S = _build_sparse_similarity(
+        X, n_neighbors, n_epochs, device,
+        soft_prune=soft_prune, soft_prune_temperature=soft_prune_temperature,
+    )
+
+    if differentiable_eps and not use_chunking:
+        raise ValueError(
+            "differentiable_eps=True (implicit-differentiation eps) is only "
+            "implemented for the chunked path -- pass use_chunking=True, or "
+            "set differentiable_eps=False to use the dense path as before."
+        )
 
     if use_chunking:
         return compute_weights_from_similarity_chunked(
             S, n, nbd_sample_count_threshold, satisfiability_proportion,
-            max_iters_weight_count, chunk_size, temperature, eps
+            max_iters_weight_count, chunk_size, temperature, eps,
+            differentiable_eps=differentiable_eps,
+            eps_count_temperature=eps_count_temperature,
+            eps_threshold_temperature=eps_threshold_temperature,
         )
     else:
         return compute_weights_from_similarity_dense(
@@ -663,49 +664,8 @@ def get_empirical_weights(
         )
 
 
-# ---------------------------------------------------------------------------
-# Core shift kernel
-#
-# Two structurally different kernels, selected once per model instance
-# (not per call):
-#
-#   sparse path : barycenter = torch.sparse.mm(W, X), where W is the
-#                 (n, n) row-normalized neighbour-weight matrix, built once
-#                 (indices_fixed + w_norm are loop-invariant across shift
-#                 iterations). No (n, k, d) gather every iteration.
-#   gather path : original X[indices] gather + weighted sum. Used when
-#                 sparse ops aren't supported on the target device (see
-#                 _sparse_mm_supported) or explicitly disabled.
-#
-# IMPORTANT: torch.compile cannot trace a function that takes a sparse
-# tensor as an argument at all ("Attempted to wrap sparse Tensor") --
-# this is a hard limitation, unrelated to whether the *eager* op runs fine
-# (which _sparse_mm_supported checks). So torch.sparse.mm is always called
-# eagerly, outside any compiled region; only the movement math that follows
-# (dense-only: diff, clipping, update) is compiled.
-#
-# clipping / clip_mode / low_precision are captured as plain Python closure
-# constants, not passed as runtime tensor/scalar arguments, so each
-# compiled kernel is one straight-line graph with no runtime branch and no
-# per-call guard/recompile risk.
-# ---------------------------------------------------------------------------
-
 def _build_sparse_weight_matrix(indices_i64, w_norm, n_rows, n_cols, device):
-    """
-    (n_rows, n_cols) sparse COO weight matrix from a fixed (n_rows, k)
-    neighbour index table and its row-normalized weights. Built once per
-    forward() call (indices_fixed and w_norm don't change across shift
-    iterations), then reused every iteration via torch.sparse.mm(W, corpus)
-    in place of a fresh gather. NOTE: sparse_coo_tensor indices must be
-    int64 -- pass the int64 copy of indices_fixed here, not the int32
-    gather-path copy.
-
-    n_rows is the number of query points (shifted_dataset); n_cols is the
-    number of points being searched/gathered from (the corpus -- either
-    shifted_dataset itself in self-shift mode, or the fixed reference
-    manifold in reference-shift mode). They're equal in self-shift mode
-    and generally differ in reference-shift mode.
-    """
+    """Build the sparse row-normalized neighbor matrix."""
     k = indices_i64.shape[1]
     rows = torch.arange(n_rows, device=device).repeat_interleave(k)
     cols = indices_i64.reshape(-1)
@@ -716,35 +676,19 @@ def _build_sparse_weight_matrix(indices_i64, w_norm, n_rows, n_cols, device):
     ).coalesce()
 
 
-def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_precision_dtype=torch.bfloat16):
-    """
-    Compiled, dense-only kernel: given X and (for the gather path) the
-    fixed neighbour indices, produces the barycenter -- via gather+weighted
-    sum if needs_gather, or takes a precomputed barycenter tensor if not
-    (sparse path, where torch.sparse.mm already ran eagerly) -- then does
-    the movement math (diff, magnitude, optional clipping, update). Never
-    sees a sparse tensor, so it's safe to wrap in fullgraph=True.
+_MOVEMENT_GATE_EPS = 1e-8
 
-    Called as:
-      needs_gather=True  (dense path):  _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate, corpus)
-      needs_gather=False (sparse path): _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate, corpus)
-    In both cases the 3rd argument is either the (n, k) weight tensor
-    (gather path) or the already-computed (n, d) barycenter (sparse path);
-    which one it is is fixed by needs_gather, a closure constant.
 
-    `corpus` is the (m, d) tensor that `indices` index into -- the points
-    being gathered/shifted towards. In self-shift mode this is X itself
-    (m == n); in reference-shift mode it's the fixed reference manifold
-    (m can differ from n). Passing it explicitly, rather than always
-    reading from X, is what lets the same kernel serve both modes.
-    """
+def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_precision_dtype=torch.bfloat16,
+                           smooth_movement_gate=False):
+    """Build the compiled dense movement kernel."""
 
     def _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate, corpus):
         n, k = indices.shape
         neighbor_pos = None
 
         if needs_gather:
-            neighbor_pos = corpus[indices]                              # (n, k, d) -- one gather
+            neighbor_pos = corpus[indices]
             if low_precision:
                 lp_w = w_or_barycenter.to(low_precision_dtype)
                 lp_neighbors = neighbor_pos.to(low_precision_dtype)
@@ -752,15 +696,14 @@ def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_
             else:
                 barycenter = (w_or_barycenter.unsqueeze(-1) * neighbor_pos).sum(dim=1)
         else:
-            barycenter = w_or_barycenter                                # already computed via sparse.mm outside
+            barycenter = w_or_barycenter
 
         diff = barycenter - X
         dist_move = diff.norm(dim=1)
-        moved = dist_move >= 1e-8
 
         if clipping and clip_mode > 0:
             if neighbor_pos is None:
-                neighbor_pos = corpus[indices]      # only extra gather needed under the sparse path
+                neighbor_pos = corpus[indices]
             dists = torch.cdist(X.unsqueeze(1), neighbor_pos).squeeze(1)
             median_dist = dists.sort(dim=1).values[:, k // 2]
             delta = (alpha * median_dist).clamp_min(1e-8)
@@ -773,35 +716,35 @@ def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_
 
         dist_move_safe = dist_move.clamp_min(1e-12)
         scale = (learning_rate * effective_step / dist_move_safe).unsqueeze(-1)
+        step = gate * scale * diff
 
-        updated = X + gate * scale * diff
-        revised_d = torch.where(moved.unsqueeze(-1), updated, X)
-        change = torch.where(moved, dist_move, torch.zeros_like(dist_move))
+        if smooth_movement_gate:
+            movement_gate = dist_move / (dist_move + _MOVEMENT_GATE_EPS)
+            revised_d = X + movement_gate.unsqueeze(-1) * step
+            change = movement_gate * dist_move
+        else:
+            moved = dist_move >= _MOVEMENT_GATE_EPS
+            updated = X + step
+            revised_d = torch.where(moved.unsqueeze(-1), updated, X)
+            change = torch.where(moved, dist_move, torch.zeros_like(dist_move))
+
         return revised_d, change
 
     return torch.compile(_kernel, fullgraph=True)
 
 
-def _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision, low_precision_dtype=torch.bfloat16):
-    """
-    Build the top-level shift step for a fixed
-    (clipping, clip_mode, use_sparse, low_precision) configuration. Call
-    once per model instance and reuse -- not per shift iteration.
-
-    Returns a plain (uncompiled) Python function -- it does the eager
-    torch.sparse.mm when use_sparse, then delegates to a compiled
-    dense-only movement kernel. The wrapper itself must stay uncompiled:
-    that's what keeps the sparse tensor from ever entering a compiled
-    region.
-    """
+def _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision, low_precision_dtype=torch.bfloat16,
+                        smooth_movement_gate=False):
+    """Build one cached shift step for a fixed configuration."""
     movement_kernel = _make_movement_kernel(
         clipping, clip_mode, needs_gather=not use_sparse,
         low_precision=low_precision, low_precision_dtype=low_precision_dtype,
+        smooth_movement_gate=smooth_movement_gate,
     )
 
     if use_sparse:
         def _shift(X, indices, w_or_W, learning_rate, alpha, gate, corpus):
-            barycenter = torch.sparse.mm(w_or_W, corpus)      # eager -- torch.compile can't wrap sparse tensors
+            barycenter = torch.sparse.mm(w_or_W, corpus)
             return movement_kernel(X, indices, barycenter, learning_rate, alpha, gate, corpus)
     else:
         def _shift(X, indices, w_or_W, learning_rate, alpha, gate, corpus):
@@ -810,22 +753,378 @@ def _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision, low_preci
     return _shift
 
 
-# Cache kernels across model instances that share the same config -- avoids
-# both a redundant Python closure build and (for the compiled inner
-# movement kernel) a redundant torch.compile trace for identical configs.
 _SHIFT_KERNEL_CACHE = {}
 
 
-def _get_shift_kernel(clipping, clip_mode, use_sparse, low_precision):
-    key = (clipping, clip_mode, use_sparse, low_precision)
+def _get_shift_kernel(clipping, clip_mode, use_sparse, low_precision, smooth_movement_gate=False):
+    key = (clipping, clip_mode, use_sparse, low_precision, smooth_movement_gate)
     if key not in _SHIFT_KERNEL_CACHE:
-        _SHIFT_KERNEL_CACHE[key] = _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision)
+        _SHIFT_KERNEL_CACHE[key] = _make_shift_kernel(
+            clipping, clip_mode, use_sparse, low_precision, smooth_movement_gate=smooth_movement_gate,
+        )
     return _SHIFT_KERNEL_CACHE[key]
 
 
 # ---------------------------------------------------------------------------
-# Core shift loop (Fully Differentiable)
+# Strict end-to-end differentiable path
 # ---------------------------------------------------------------------------
+# The original MSDE path deliberately uses a hard sparse graph. That path is
+# retained above for speed/backwards compatibility. The helpers below are a
+# continuous relaxation of the same ingredients:
+#   * soft k-NN is obtained by solving a smooth occupancy equation
+#       sum_j sigmoid((tau_i - d_ij) / T) = k
+#     rather than calling topk;
+#   * fuzzy graph union is computed densely, with no data-dependent indexing;
+#   * rho and sigma are obtained by fixed, differentiable Newton iterations;
+#   * epsilon is obtained by a smooth root solve over soft counts;
+#   * pruning is a sigmoid gate, never a nonzero()/hard active-edge subset;
+#   * movement uses dense weighted barycenters and a smooth zero-movement gate;
+#   * all iteration counts are fixed (no data-dependent early stopping).
+#
+# This path is O(N^2) in memory/time for an N-point manifold. That cost is the
+# unavoidable trade-off for exact end-to-end gradients through neighbor
+# membership and graph topology without a learned/approximate sparse kernel.
+
+_DIFF_EPS = 1e-8
+_DIFF_LOG_SCALE_EPS = 1e-6
+_DIFF_SOLVER_ITERATIONS = 25
+_DEFAULT_DIFF_TEMPERATURE = 0.1
+
+
+def _smooth_pairwise_dist(X, Y):
+    """Pairwise Euclidean distances with a smooth zero-distance guard."""
+    diff = X.unsqueeze(1) - Y.unsqueeze(0)
+    return torch.sqrt(diff.square().sum(dim=-1) + _DIFF_EPS**2)
+
+
+def _masked_soft_knn_weights(
+    X,
+    corpus,
+    k,
+    temperature,
+    labels=None,
+    corpus_labels=None,
+    exclude_self=False,
+    iterations=20,
+):
+    """Continuous relaxation of k-NN over *all* candidate points.
+
+    For every query row i we solve for tau_i so the sigmoid occupancies have
+    total mass approximately k. Unlike topk, every candidate receives a
+    differentiable (possibly very small) membership weight.
+    """
+    if temperature is None:
+        raise ValueError("A positive temperature is required for differentiable soft k-NN")
+    temperature = torch.as_tensor(temperature, dtype=X.dtype, device=X.device)
+    temperature = torch.sqrt(temperature.square() + _DIFF_EPS**2)
+
+    d = _smooth_pairwise_dist(X, corpus)
+    valid = torch.ones(d.shape, dtype=torch.bool, device=d.device)
+
+    if exclude_self:
+        if X.shape[0] != corpus.shape[0]:
+            raise ValueError("exclude_self=True requires query and corpus to have the same size")
+        valid = valid & ~torch.eye(X.shape[0], dtype=torch.bool, device=d.device)
+
+    if labels is not None:
+        if corpus_labels is None:
+            corpus_labels = labels
+        same_class = labels.unsqueeze(1) == corpus_labels.unsqueeze(0)
+        valid = valid & same_class
+
+    valid_f = valid.to(d.dtype)
+    valid_count = valid_f.sum(dim=1)
+    target = torch.minimum(
+        valid_count,
+        torch.full_like(valid_count, float(k)),
+    )
+
+    mean_d = (d * valid_f).sum(dim=1) / (valid_count + _DIFF_EPS)
+    tau = mean_d
+
+    max_tau_step = 4.0 * (mean_d.detach().mean() + 1.0)
+    max_tau_step = torch.as_tensor(max_tau_step, dtype=d.dtype, device=d.device)
+
+    for _ in range(iterations):
+        membership = torch.sigmoid((tau.unsqueeze(1) - d) / temperature) * valid_f
+        residual = membership.sum(dim=1) - target
+        derivative = (
+            membership * (1.0 - membership)
+        ).sum(dim=1) / temperature
+        raw_step = residual / (derivative + _DIFF_EPS)
+        step = max_tau_step * torch.tanh(raw_step / (max_tau_step + _DIFF_EPS))
+        tau = tau - step
+
+    membership = torch.sigmoid((tau.unsqueeze(1) - d) / temperature) * valid_f
+    return d, membership, valid
+
+
+def _soft_fuzzy_graph(
+    X,
+    k,
+    temperature,
+    prune_temperature,
+    n_epochs,
+    exclude_self=True,
+    sigma_iterations=20,
+    knn_iterations=20,
+):
+    """Build a dense, differentiable fuzzy graph and density prior."""
+    d, membership, valid = _masked_soft_knn_weights(
+        X,
+        X,
+        k,
+        temperature,
+        exclude_self=exclude_self,
+        iterations=knn_iterations,
+    )
+    valid_f = valid.to(d.dtype)
+    valid_count = valid_f.sum(dim=1)
+
+    # Smooth approximation to UMAP's rho = first non-zero neighbor distance.
+    safe_d = d + (~valid).to(d.dtype) * 1.0e6
+    rho_temp = temperature
+    rho = -rho_temp * torch.logsumexp(-safe_d / rho_temp, dim=1)
+    rho = torch.where(valid_count > 0, rho, torch.zeros_like(rho))
+
+    # Smooth positive approximation to relu(d-rho).
+    offset = rho_temp * F.softplus((d - rho.unsqueeze(1)) / rho_temp)
+
+    # Smooth replacement for the rho/sigma binary search. We solve in log(sigma)
+    # so positivity is guaranteed, and bound each Newton step with tanh rather
+    # than a hard clamp.
+    sigma_target = torch.minimum(
+        valid_count,
+        torch.full_like(valid_count, float(torch.log2(torch.tensor(max(k, 1), dtype=d.dtype)))),
+    )
+    # Prevent an impossible exact target when fewer points than the desired
+    # target are available.
+    sigma_target = sigma_target * (valid_count > 0).to(d.dtype)
+    init_sigma = (offset * valid_f).sum(dim=1) / (valid_count + _DIFF_EPS)
+    log_sigma = torch.log(init_sigma + _DIFF_LOG_SCALE_EPS)
+
+    max_log_sigma_step = 2.0
+    for _ in range(sigma_iterations):
+        sigma = torch.exp(log_sigma)
+        q = torch.exp(-offset / sigma) * valid_f
+        residual = q.sum(dim=1) - sigma_target
+        derivative = (q * offset / sigma).sum(dim=1)
+        raw_step = residual / (derivative + _DIFF_EPS)
+        step = max_log_sigma_step * torch.tanh(raw_step / max_log_sigma_step)
+        log_sigma = log_sigma - step
+
+    sigma = torch.exp(log_sigma)
+    fuzzy = membership * torch.exp(-offset / sigma)
+
+    # Dense fuzzy union: w + w^T - w*w^T. No edge matching/index search.
+    w_sym = fuzzy + fuzzy.transpose(0, 1) - fuzzy * fuzzy.transpose(0, 1)
+
+    # Soft pruning. The threshold uses a smooth log-sum-exp approximation of
+    # max() and then a sigmoid gate; importantly, there is no active-edge
+    # nonzero()/hard mask.
+    prune_temperature = torch.as_tensor(
+        prune_temperature, dtype=X.dtype, device=X.device
+    )
+    prune_temperature = torch.sqrt(prune_temperature.square() + _DIFF_EPS**2)
+    smooth_max = prune_temperature * torch.logsumexp(
+        w_sym.reshape(-1) / prune_temperature, dim=0
+    )
+    threshold = smooth_max / max(n_epochs, 1)
+    gate = torch.sigmoid((w_sym - threshold) / prune_temperature)
+    w_soft = w_sym * gate
+
+    return w_soft
+
+
+def _smooth_epsilon_from_graph(
+    graph,
+    nbd_sample_count_threshold,
+    satisfiability_proportion,
+    count_temperature,
+    threshold_temperature,
+    iterations=25,
+):
+    """Differentiate through epsilon selection using a smooth fixed-point solve."""
+    n = graph.shape[0]
+    d_graph = _smooth_pairwise_dist(graph, graph)
+    offdiag = ~torch.eye(n, dtype=torch.bool, device=graph.device)
+    valid = offdiag.to(d_graph.dtype)
+
+    count_temperature = torch.as_tensor(
+        count_temperature, dtype=graph.dtype, device=graph.device
+    ).square().add(_DIFF_EPS**2).sqrt()
+    threshold_temperature = torch.as_tensor(
+        threshold_temperature, dtype=graph.dtype, device=graph.device
+    ).square().add(_DIFF_EPS**2).sqrt()
+
+    mean_dist = (d_graph * valid).sum() / (valid.sum() + _DIFF_EPS)
+    log_eps = torch.log(mean_dist + _DIFF_LOG_SCALE_EPS)
+
+    threshold = float(max(1, n - 1) if nbd_sample_count_threshold >= n else nbd_sample_count_threshold)
+    target_fraction = torch.as_tensor(
+        float(satisfiability_proportion), dtype=graph.dtype, device=graph.device
+    )
+
+    max_log_eps_step = 2.0
+    for _ in range(iterations):
+        eps = torch.exp(log_eps)
+        soft_counts = (
+            torch.sigmoid((eps - d_graph) / count_temperature) * valid
+        ).sum(dim=1)
+        satisfaction = torch.sigmoid(
+            (soft_counts - threshold) / threshold_temperature
+        )
+        residual = satisfaction.mean() - target_fraction
+
+        dcount_deps = (
+            torch.sigmoid((eps - d_graph) / count_temperature)
+            * (1.0 - torch.sigmoid((eps - d_graph) / count_temperature))
+            / count_temperature
+            * valid
+        ).sum(dim=1)
+        dsat_dcount = satisfaction * (1.0 - satisfaction) / threshold_temperature
+        dres_deps = (dsat_dcount * dcount_deps).mean()
+        dres_dlogeps = dres_deps * eps
+        raw_step = residual / (dres_dlogeps + _DIFF_EPS)
+        step = max_log_eps_step * torch.tanh(raw_step / max_log_eps_step)
+        log_eps = log_eps - step
+
+    return torch.exp(log_eps), d_graph, valid
+
+
+def _differentiable_empirical_weights(
+    X,
+    n_neighbors,
+    n_epochs,
+    nbd_sample_count_threshold,
+    satisfiability_proportion,
+    max_iters_weight_count,
+    temperature,
+    eps=None,
+    eps_threshold_temperature=None,
+    eps_solver_iterations=25,
+):
+    """Fully differentiable analogue of the empirical density-weight pass."""
+    if temperature is None:
+        raise ValueError(
+            "fully_differentiable=True requires temperature > 0 so all counting "
+            "operations remain smooth"
+        )
+    if eps_threshold_temperature is None:
+        eps_threshold_temperature = temperature
+
+    graph = _soft_fuzzy_graph(
+        X,
+        n_neighbors,
+        temperature,
+        temperature,
+        n_epochs,
+        knn_iterations=eps_solver_iterations,
+    )
+
+    if eps is None:
+        eps_tensor, graph_dist, valid_graph = _smooth_epsilon_from_graph(
+            graph,
+            nbd_sample_count_threshold,
+            satisfiability_proportion,
+            temperature,
+            eps_threshold_temperature,
+            iterations=eps_solver_iterations,
+        )
+    else:
+        eps_tensor = eps
+        graph_dist = _smooth_pairwise_dist(graph, graph)
+        valid_graph = (
+            ~torch.eye(graph.shape[0], dtype=torch.bool, device=graph.device)
+        ).to(graph.dtype)
+
+    # Sample the soft count at a fixed sequence of positive radii. Unlike the
+    # old implementation there is no discrete indicator and no self subtraction
+    # because the fixed diagonal is excluded by valid_graph.
+    total_counts = torch.zeros(X.shape[0], dtype=X.dtype, device=X.device)
+    steps = max(max_iters_weight_count, 1)
+    for i in range(steps):
+        frac = (i + 0.5) / steps
+        eps_running = eps_tensor * (1.0 - frac) + _DIFF_LOG_SCALE_EPS * frac
+        counts = (
+            torch.sigmoid((eps_running - graph_dist) / (torch.sqrt(torch.as_tensor(temperature, dtype=X.dtype, device=X.device).square() + _DIFF_EPS**2)))
+            * valid_graph
+        ).sum(dim=1)
+        total_counts = total_counts + counts
+
+    return total_counts / steps
+
+
+def _soft_minimum(a, b, temperature):
+    """Smooth approximation to min(a,b)."""
+    return 0.5 * (
+        a + b - torch.sqrt((a - b).square() + temperature**2)
+    )
+
+
+def _differentiable_shift_step(
+    X,
+    corpus,
+    base_weights,
+    k,
+    learning_rate,
+    alpha,
+    gate,
+    temperature,
+    labels=None,
+    corpus_labels=None,
+    reference_mode=False,
+    clipping=False,
+    clip_mode=0,
+    smooth_iterations=20,
+):
+    """One fully differentiable MSDE movement step."""
+    d, membership, _ = _masked_soft_knn_weights(
+        X,
+        corpus,
+        k,
+        temperature,
+        labels=labels,
+        corpus_labels=corpus_labels,
+        exclude_self=not reference_mode,
+        iterations=smooth_iterations,
+    )
+
+    # base_weights are row-wise density priors for the corpus, exactly like the
+    # old selected-neighbor weights, but every corpus point now participates
+    # with a continuous soft-kNN membership weight.
+    w = membership * base_weights.unsqueeze(0)
+    mass = w.sum(dim=1)
+    numerator = w @ corpus
+    barycenter = numerator / (mass.unsqueeze(1) + _DIFF_EPS)
+
+    # A smooth validity/orphan gate: if mass -> 0, the proposed movement -> 0.
+    valid_gate = mass / (mass + _DIFF_EPS)
+    diff = barycenter - X
+    dist_move = torch.sqrt(diff.square().sum(dim=1) + _DIFF_EPS**2)
+
+    effective_step = dist_move
+    if clipping and clip_mode > 0:
+        neighbor_mean_dist = (membership * d).sum(dim=1) / (membership.sum(dim=1) + _DIFF_EPS)
+        delta = alpha * neighbor_mean_dist
+        if clip_mode == 1:
+            effective_step = dist_move * (delta / (delta + dist_move + _DIFF_EPS))
+        else:
+            effective_step = _soft_minimum(
+                dist_move,
+                delta,
+                torch.sqrt(torch.as_tensor(temperature, dtype=X.dtype, device=X.device).square() + _DIFF_EPS**2),
+            )
+    elif clipping:
+        effective_step = dist_move
+
+    movement_gate = dist_move / (dist_move + _DIFF_EPS)
+    scale = learning_rate * effective_step / (dist_move + _DIFF_EPS)
+    step = gate * valid_gate.unsqueeze(1) * movement_gate.unsqueeze(1) * scale.unsqueeze(1) * diff
+    revised = X + step
+    change = valid_gate * movement_gate * dist_move
+    return revised, change
+
 
 class MeanShiftDensityEnhancement(torch.nn.Module):
     def __init__(
@@ -853,10 +1152,44 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         use_sparse_shift=True,
         low_precision_barycenter=False,
         recompute_neighbors=0,
+        smooth_movement_gate=False,
+        fully_differentiable=False,
+        # Legacy differentiability controls are retained for source compatibility.
+        # In fully_differentiable mode they are derived automatically from
+        # `temperature` and should normally not be specified.
+        differentiable_solver_iterations=None,
+        use_soft_topk=False,
+        soft_topk_temperature=None,
+        learn_soft_topk_temperature=False,
         X=None,
         labels=None,
     ):
         """
+        smooth_movement_gate : legacy control for the original sparse path.
+            In ``fully_differentiable=True`` mode the movement gate is always
+            smooth, so this option is not needed.
+        fully_differentiable : when True, use the dense continuous relaxation of
+            the entire MSDE computation. This is the only switch needed to turn
+            on end-to-end differentiability. Set ``temperature`` to control the
+            smoothness of neighbour assignment and density counting. The same
+            temperature is automatically reused for every relaxation in this
+            mode; solver iteration counts and pruning/movement temperatures are
+            chosen internally. The differentiable path is O(N^2).
+            Typical usage is simply::
+
+                msde = MeanShiftDensityEnhancement(
+                    k=30, temperature=0.1, fully_differentiable=True
+                )
+
+            No separate soft-top-k, pruning, epsilon, or solver-temperature
+            hyperparameters are needed.
+        differentiable_solver_iterations : legacy/advanced override. In normal
+            use leave this as None; the differentiable path uses a fixed internal
+            solver budget.
+        use_soft_topk, soft_topk_temperature, learn_soft_topk_temperature :
+            legacy controls for the intermediate partially-differentiable path.
+            They are ignored in ``fully_differentiable=True`` mode because soft
+            neighbour assignment is enabled automatically.
         X : optional (m, d) tensor -- a fixed reference manifold. When
             given, forward() no longer shifts its input against itself:
             every point of the (different) X passed to forward() is
@@ -877,10 +1210,27 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         """
         super().__init__()
 
+        # In fully differentiable mode, `temperature` is the single relaxation
+        # hyperparameter. Everything else is derived internally.
+        if fully_differentiable and temperature is None:
+            temperature = _DEFAULT_DIFF_TEMPERATURE
+        if temperature is not None and float(torch.as_tensor(temperature).detach().cpu()) <= 0:
+            raise ValueError("temperature must be > 0")
         if learn_temperature and temperature is None:
-            raise ValueError("learn_temperature=True requires an explicit initial temperature")
+            raise ValueError("learn_temperature=True requires an initial temperature")
         if learn_eps and temperature is None:
             raise ValueError("learn_eps=True requires temperature to enable differentiable weights")
+        if use_soft_topk and soft_topk_temperature is None and not fully_differentiable:
+            raise ValueError("use_soft_topk=True requires an explicit soft_topk_temperature")
+        if learn_soft_topk_temperature and not use_soft_topk and not fully_differentiable:
+            raise ValueError("learn_soft_topk_temperature=True requires use_soft_topk=True")
+        if fully_differentiable and learn_eps and eps is None:
+            raise ValueError(
+                "fully_differentiable=True with learn_eps=True requires an explicit initial eps"
+            )
+        if differentiable_solver_iterations is not None:
+            if not isinstance(differentiable_solver_iterations, int) or differentiable_solver_iterations < 1:
+                raise ValueError("differentiable_solver_iterations must be a positive integer")
         if recompute_neighbors is not None and (
             not isinstance(recompute_neighbors, int) or isinstance(recompute_neighbors, bool) or recompute_neighbors < 0
         ):
@@ -903,6 +1253,13 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.enable_gradients = enable_gradients
         self.log_file = log_file
         self.learn_eps = learn_eps
+        self.smooth_movement_gate = (True if fully_differentiable else smooth_movement_gate)
+        self.fully_differentiable = fully_differentiable
+        self.differentiable_solver_iterations = (
+            differentiable_solver_iterations if differentiable_solver_iterations is not None
+            else _DIFF_SOLVER_ITERATIONS
+        )
+        self.use_soft_topk = (True if fully_differentiable else use_soft_topk)
         # Normalize None -> 0 so the forward()-loop guard can treat both as
         # "falsy => never recompute after the first iteration" uniformly.
         self.recompute_neighbors = recompute_neighbors or 0
@@ -913,20 +1270,34 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.use_sparse_shift = use_sparse_shift and _sparse_mm_supported(device)
         self.low_precision_barycenter = low_precision_barycenter
         self._shift_kernel = _get_shift_kernel(
-            self.clipping, self.clip_mode, self.use_sparse_shift, self.low_precision_barycenter
+            self.clipping, self.clip_mode, self.use_sparse_shift, self.low_precision_barycenter,
+            smooth_movement_gate=self.smooth_movement_gate,
         )
 
         dtype = next(
-            (value.dtype for value in (learning_rate, alpha, temperature, eps)
+            (value.dtype for value in (learning_rate, alpha, temperature, eps, soft_topk_temperature)
              if isinstance(value, torch.Tensor) and value.is_floating_point()),
             torch.get_default_dtype(),
         )
+        # In fully differentiable mode there is deliberately one public
+        # smoothness parameter: `temperature`. The legacy
+        # `learn_soft_topk_temperature=True` flag therefore also means
+        # "learn the single temperature" for backwards compatibility.
+        if fully_differentiable:
+            soft_topk_temperature = temperature
+            learn_temperature = learn_temperature or learn_soft_topk_temperature
+
         scalar_options = (
             ("learning_rate", learning_rate, learn_learning_rate),
             ("alpha", alpha, learn_alpha),
             ("temperature", temperature, learn_temperature),
             ("eps", eps, learn_eps),
         )
+        if not fully_differentiable:
+            scalar_options = scalar_options + (
+                ("soft_topk_temperature", soft_topk_temperature, learn_soft_topk_temperature),
+            )
+
         self.learnable_parameters = {}
         for name, value, learnable in scalar_options:
             if name == "eps" and learnable and value is None:
@@ -943,6 +1314,14 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                 self.learnable_parameters[name] = parameter
             else:
                 self.register_buffer(name, scalar)
+
+        # In fully differentiable mode, expose the legacy soft-top-k parameter
+        # name as an alias to the single temperature Parameter. It is the same
+        # object, so there is still only one learnable smoothness hyperparameter.
+        if fully_differentiable:
+            self.soft_topk_temperature = self.temperature
+            if enable_gradients and learn_soft_topk_temperature:
+                self.learnable_parameters["soft_topk_temperature"] = self.temperature
 
         # Reference-manifold mode: X given here is a fixed corpus that
         # every future forward(X_new) shifts X_new against, instead of
@@ -997,15 +1376,23 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             to clear everything when X is also None.
         """
         if X is not None:
-            X_ref = torch.as_tensor(X, device=self.device_name).detach()
+            X_ref = torch.as_tensor(
+                X, device=self.device_name
+            ) if self.fully_differentiable else torch.as_tensor(X, device=self.device_name).detach()
             if X_ref.dim() != 2:
                 raise ValueError(
                     f"X (reference manifold) must be 2D (n_ref, d); got shape {tuple(X_ref.shape)}"
                 )
             self._buffers.pop("X_ref", None)
             self.register_buffer("X_ref", X_ref)
-            with torch.no_grad():
-                self._ref_base_weights = self._compute_base_weights(self.X_ref).detach()
+            if self.fully_differentiable:
+                # The strict path recomputes the reference density prior inside
+                # forward() so it remains connected to learnable temperatures/eps
+                # and to a reference tensor that still requires gradients.
+                self._ref_base_weights = None
+            else:
+                with torch.no_grad():
+                    self._ref_base_weights = self._compute_base_weights(self.X_ref).detach()
             self._set_ref_labels(labels, X_ref.shape[0])
         elif labels is not None:
             if getattr(self, "X_ref", None) is None:
@@ -1031,7 +1418,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         """
         if self.learn_eps and self.eps is None:
             similarity = _build_sparse_similarity(X, 15, 200, self.device_name)
-            # Build once, reuse for both the eps calc below and the chunked weight pass that follows
             layout = _sparse_similarity_layout(similarity)
             with torch.no_grad():
                 eps_initial = _calculate_eps_from_similarity(
@@ -1082,6 +1468,98 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             )
         return base_weights_t
 
+    def _forward_fully_differentiable(self, X, gate=1.0, labels=None):
+        """Execute the continuous end-to-end differentiable MSDE path."""
+        if not self.enable_gradients:
+            X = X.detach()
+
+        reference_mode = self.X_ref is not None
+        ref_labels = self._ref_labels if reference_mode else None
+
+        if reference_mode:
+            if X.dim() != 2 or X.shape[1] != self.X_ref.shape[1]:
+                raise ValueError(
+                    f"X passed to forward() has feature dim {tuple(X.shape[1:])}, "
+                    f"which doesn't match the reference manifold's feature dim "
+                    f"{tuple(self.X_ref.shape[1:])}."
+                )
+            corpus = self.X_ref
+        else:
+            corpus = X
+
+        if labels is not None and reference_mode and ref_labels is None:
+            raise ValueError(
+                "labels was passed to forward(), but the reference manifold has no labels"
+            )
+
+        masked = labels is not None
+        if masked:
+            labels = torch.as_tensor(labels, device=self.device_name).detach().long()
+            if labels.dim() != 1 or labels.shape[0] != X.shape[0]:
+                raise ValueError(
+                    f"labels must be 1D with length matching X (n={X.shape[0]}); "
+                    f"got shape {tuple(labels.shape)}"
+                )
+
+        # A single temperature controls every smooth relaxation.
+        count_temperature = self.temperature
+        knn_temperature = count_temperature
+        eps_threshold_temperature = count_temperature
+
+        # Density prior. In reference mode this is recomputed in differentiable
+        # mode so learnable temperatures/eps still participate in the graph.
+        base_weights = _differentiable_empirical_weights(
+            corpus,
+            self.k,
+            200,
+            self.nbd_sample_count_threshold,
+            0.3,
+            4,
+            count_temperature,
+            eps=self.eps,
+            eps_threshold_temperature=eps_threshold_temperature,
+            eps_solver_iterations=self.differentiable_solver_iterations,
+        )
+
+        shifted_dataset = X.clone()
+        total_distance = torch.zeros(
+            X.shape[0], dtype=X.dtype, device=X.device
+        )
+        trajectory = [shifted_dataset.clone()] if self.keep_trajectory else []
+
+        # Fixed iteration count: no .item()-based convergence branch can change
+        # the computational graph.
+        for iter_count in range(self.max_iters_shift):
+            corpus_for_shift = self.X_ref if reference_mode else shifted_dataset
+            corpus_labels = ref_labels if reference_mode else labels
+            shifted_dataset, change = _differentiable_shift_step(
+                shifted_dataset,
+                corpus_for_shift,
+                base_weights,
+                self.k,
+                self.learning_rate,
+                self.alpha,
+                gate,
+                knn_temperature,
+                labels=labels if masked else None,
+                corpus_labels=corpus_labels if masked else None,
+                reference_mode=reference_mode,
+                clipping=self.clipping,
+                clip_mode=self.clip_mode,
+                smooth_iterations=self.differentiable_solver_iterations,
+            )
+            total_distance = total_distance + change
+            if self.keep_trajectory:
+                trajectory.append(shifted_dataset.clone())
+
+            # Logging only; this scalar never controls execution.
+            logger.debug(
+                f"Differentiable iter {iter_count + 1}: "
+                f"mean change = {float(change.detach().mean()):.6f}"
+            )
+
+        return shifted_dataset, total_distance, trajectory
+
     def forward(self, X, gate=1.0, labels=None):
         """
         Run MSDE and return shifted data, movement, and trajectory.
@@ -1113,6 +1591,9 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             is left unmoved for that call (no valid direction to shift
             it in) rather than shifted towards a meaningless barycenter.
         """
+        if self.fully_differentiable:
+            return self._forward_fully_differentiable(X, gate=gate, labels=labels)
+
         if not self.enable_gradients:
             X = X.detach()
 
@@ -1128,8 +1609,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                     f"both to live in the same feature space; point count and "
                     f"order may still differ freely."
                 )
-            # Fixed corpus -- its density weights were already computed
-            # once at init time (see __init__), so no per-call recompute.
             base_weights_t = self._ref_base_weights
         else:
             base_weights_t = self._compute_base_weights(X)
@@ -1161,37 +1640,10 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             f"Computing fixed k-NN (k={self.k}) in feature space on {self.device_name} ..."
         )
 
-        # indices_fixed / w_norm / w_or_W are (re)built either once, before
-        # the loop (recompute_neighbors=0/None -- original "fixed neighbour
-        # graph" behaviour, cheapest), or every N iterations
-        # (recompute_neighbors=N -- periodic adaptive mean-shift: the
-        # neighbour graph tracks shifted_dataset every N steps instead of
-        # every step, damping the runaway-collapse feedback loop that
-        # recomputing every single iteration produces -- see below). The
-        # block itself is identical in every case; only *when* it runs
-        # changes, via the `iter_count == 0 or iter_count % self.recompute_neighbors == 0`
-        # guard below. iter_count == 0 always (re)builds it regardless of N,
-        # since indices_fixed/w_or_W don't exist yet on the first pass.
-        #
-        # Note base_weights_t itself is NOT recomputed here even when
-        # recompute_neighbors is set -- it comes from a separate, far more
-        # expensive pipeline (get_empirical_weights's eps binary search over
-        # the *original* X, or over the reference manifold in reference
-        # mode) and is treated as a static "how typical is this point"
-        # prior. Only the neighbour topology used for the barycenter
-        # gather/spmm is refreshed. Recomputing base_weights_t on the
-        # shifted data would be possible too, but multiplies the dominant
-        # cost of forward() by (max_iters_shift // N) -- do that only if you
-        # have a specific reason the density prior itself needs to track the
-        # shift, not just the neighbour set.
         indices_fixed = None
         w_or_W = None
         orphan_mask = None    # (n,) bool -- points with zero same-class neighbours this recompute
 
-        # In self-shift mode, the corpus being searched/gathered from is
-        # shifted_dataset itself, so it moves every iteration. In
-        # reference-shift mode it's the fixed reference manifold, which
-        # never changes -- resolved once here rather than every iteration.
         corpus_size = self.X_ref.shape[0] if reference_mode else n_samples
         corpus_labels = ref_labels if reference_mode else labels   # self mode: corpus IS X, so its labels are `labels`
 
@@ -1202,18 +1654,11 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                 self.recompute_neighbors and iter_count % self.recompute_neighbors == 0
             ):
                 with torch.no_grad():
-                    # int64 needed for torch.sparse_coo_tensor's index tensor;
-                    # int32 halves gather bandwidth for the dense fallback path
-                    # and for the clipping-only gather under the sparse path.
-                    # Safe given n <= ~100k always fits comfortably in int32's
-                    # range -- if you ever run this on datasets north of
-                    # ~2^31 points, keep indices_fixed as int64 instead.
                     knn_kwargs = {}
                     if masked:
                         knn_kwargs["labels"] = labels
                         if reference_mode:
                             knn_kwargs["corpus_labels"] = corpus_labels
-                        # self mode: corpus_labels defaults to `labels` inside torch_knn
 
                     indices_fixed_i64 = compute_fixed_knn(
                         shifted_dataset.detach(), self.k, device=self.device_name,
@@ -1224,14 +1669,13 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
 
                 w = base_weights_t[indices_fixed_i64]                        # (n, k)
 
+                if self.use_soft_topk:
+                    soft_topk_w = _SOFT_TOPK_WEIGHT_KERNEL(
+                        shifted_dataset, corpus_for_shift, indices_fixed_i64, self.soft_topk_temperature
+                    )
+                    w = w * soft_topk_w
+
                 if masked:
-                    # Same-class check re-derived from labels rather than
-                    # threaded through as a separate return value from
-                    # compute_fixed_knn -- cheap (one gather + compare) and
-                    # keeps compute_fixed_knn's return signature unchanged.
-                    # Zeroes weight on any slot that's cross-class (real
-                    # corpus point, wrong label) or a starvation
-                    # placeholder (+inf-distance, indeterminate index).
                     valid = corpus_labels[indices_fixed_i64] == labels.unsqueeze(1)   # (n, k) bool
                     w = w * valid
                     has_any_valid = valid.any(dim=1)                          # (n,)
@@ -1260,10 +1704,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             )
 
             if orphan_mask is not None and orphan_mask.any():
-                # No same-class neighbours at all this recompute -- w_norm's
-                # row is all-zero, which would otherwise pull the point
-                # towards a zero/garbage barycenter. Leave these points
-                # exactly where they are instead.
                 revised_d = torch.where(orphan_mask.unsqueeze(1), shifted_dataset, revised_d)
                 change = torch.where(orphan_mask, torch.zeros_like(change), change)
 
