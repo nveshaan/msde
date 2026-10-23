@@ -1,299 +1,175 @@
 # MSDE
 
-MSDE (mean-shift density enhancement) computes an empirical density weight for each point, builds a fuzzy k-nearest-neighbor graph, and repeatedly moves each point toward a weighted neighbor barycenter.
+MSDE (mean-shift density enhancement) computes an empirical density weight for each point, selects neighbours, and repeatedly moves each point toward a weighted neighbour barycenter.
 
-The main public API is `MeanShiftDensityEnhancement`:
+It is built from **four swappable components**. Each has a base class and one or more strategies, and any of them may be non-differentiable:
+
+| Component | Base class | Question it answers | Strategies |
+| --- | --- | --- | --- |
+| `msde.neighbors` | `NeighborSelector` | Which corpus points is each point pulled towards? | `HardKNN`, `SoftKNN` |
+| `msde.weights` | `DensityWeights` | How typical/dense is each corpus point? | `SparseEmpirical`, `SoftEmpirical` |
+| `msde.step` | `MovementStep` | How does a point move towards the weighted barycenter? | `PlainBarycenter`, `SoftBarycenter` |
+| `msde.loop` | `ShiftLoop` | How is the iteration run (schedule, stopping, pre/post-processing)? | `EarlyStopLoop`, `FixedLoop` |
+
+Code shared by more than one component lives in `msde.common` (`knn`, `graph`, `eps`, `labels`, `utils`). Components never import from each other.
 
 ```python
 import torch
-from msde import MeanShiftDensityEnhancement
+from msde import (
+    MeanShiftDensityEnhancement, HardKNN, SparseEmpirical, PlainBarycenter, EarlyStopLoop,
+)
 
 X = torch.randn(10_000, 128, device="cuda")
 
-# Fast/legacy path
 model = MeanShiftDensityEnhancement(
-    k=30,
+    neighbors=HardKNN(k=30, device="cuda"),
+    weights=SparseEmpirical(nbd_sample_count_threshold=30, use_chunking=True, chunk_size=2048, device="cuda"),
+    step=PlainBarycenter(learning_rate=0.3, device="cuda"),
+    loop=EarlyStopLoop(max_iters_shift=5),
     device="cuda",
-    use_chunking=True,
-    weight_chunk_size=2048,
 )
-
 shifted, movement, trajectory = model(X)
 ```
 
-`shifted` has shape `(n, d)`, `movement` has shape `(n,)` and contains accumulated movement magnitudes, and `trajectory` is empty unless `keep_trajectory=True`.
+Every component is optional; omitted ones default to the combination above. `shifted` has shape `(n, d)`, `movement` has shape `(n,)` (accumulated movement), and `trajectory` is empty unless the loop has `keep_trajectory=True`.
+
+An end-to-end differentiable configuration is just a different composition:
+
+```python
+T = 0.1
+model = MeanShiftDensityEnhancement(
+    neighbors=SoftKNN(k=30, temperature=T),
+    weights=SoftEmpirical(n_neighbors=30, nbd_sample_count_threshold=30, temperature=T),
+    step=SoftBarycenter(temperature=T),
+    loop=FixedLoop(max_iters_shift=5),
+)
+```
+
+Mixed compositions are allowed when shapes work (e.g. `HardKNN` + `SoftEmpirical` + `PlainBarycenter` keeps hard neighbours but differentiable density weights). The one hard rule: `neighbors.form` must equal `step.accepts` (`"hard"` or `"soft"`), checked at construction.
 
 ## Notation and cost model
 
-- `n`: number of query points in a self-shift or weight computation.
-- `m`: number of points in a fixed reference manifold.
-- `d`: feature dimension.
-- `k`: neighbors used by the shift graph.
-- `q`: neighbors used by the empirical-weight graph. The model uses `q=15` internally.
-- `c`: `chunk_size` or `weight_chunk_size`.
-- `I_w`: `max_iters_weight_count` in the standalone weight API. The model uses `4`.
-- `I_s`: number of shift iterations, bounded by `max_iters_shift`.
-- `r`: number of neighbor-graph rebuilds. With `recompute_neighbors=0`, `r=1`; with period `p`, `r <= ceil(I_s/p)`.
+- `n`: query points; `m`: reference-manifold points (`m=n` in self-shift); `d`: feature dimension; `k`: neighbours of the shift graph; `q`: `SparseEmpirical.n_neighbors` (default 15); `c`: chunk size; `I_s`: shift iterations; `r`: neighbour rebuilds (`r=1` for `recompute_neighbors=0`, else `<= ceil(I_s/p)`).
 
-Costs below count distance arithmetic and omit constant factors. Exact k-NN remains an all-corpus search even when chunked:
+- `HardKNN`: `O(n*m*d)` time even when chunked; `O(c*m + n*k)` working space.
+- `SparseEmpirical`: sparse graph `O(n*q)`; each chunked radius-count pass is `O(n^2*d)` with `O(c*n)` working space, up to 50 passes per epsilon search (plus a relaxed retry). The dense variant is `O(n^2*d)` time and `O(n^2)` memory.
+- `PlainBarycenter`: sparse mode ~`O(n*m*d)`; gather mode `O(n*k*d)`; clipping adds `O(n*k*d)`.
+- `SoftKNN` / `SoftEmpirical` / `SoftBarycenter`: dense `O(n*m)` memory and `O(I_s*n*m*d)` time. For self-shift this is quadratic in `n`: exact gradients through neighbour membership cannot coexist with the sparse `O(n*k)` structure.
+- Autograd retains intermediates, so peak training memory can exceed these forward estimates.
+- `torch.compile` is used for dense kernels; the first call for a new shape/configuration includes compilation, so do not benchmark it.
 
-- k-NN time: `O(n * m * d)` for a query set of size `n` and corpus of size `m`; self-search uses `m=n`.
-- k-NN working space: `O(c * m + n * k)` for the distance chunk, outputs, and indices.
-- Sparse graph storage: `O(n * q)` edges, plus `O(n)` row metadata.
-- Chunked empirical-weight passes: each radius-count pass is `O(n^2 * d)` in the graph embedding dimension and uses `O(c * n)` working space. Epsilon search performs up to 50 passes, plus a possible relaxed retry.
-- Dense empirical weights: `O(n^2 * d)` time and `O(n^2)` distance storage, in addition to the dense similarity matrix.
-- Shift step: sparse mode is approximately `O(n * m * d)` for sparse matrix multiplication; gather mode is `O(n * k * d)`. Clipping adds `O(n * k * d)` distance work.
-- Autograd can retain intermediate tensors, so peak training memory can exceed these forward working-space estimates.
+## Components
 
-`torch.compile` is used for dense kernels. The first call for a new shape/configuration can include compilation and should not be used as a steady-state benchmark.
+### Neighbours (`msde.neighbors`)
 
-## Implementation semantics
+`select(X, corpus, labels, corpus_labels, exclude_self) -> Neighbors`. `Neighbors` is a dataclass with `form="hard"` (`indices (n,k)`, `dist`, `valid`, `orphan_mask`, optional `weights`) or `form="soft"` (`membership (n,m)`, `dist`, `valid`).
 
-- The default path preserves the original sparse/hard graph semantics. Exact `topk`, hard graph membership, hard radius counts when `temperature=None`, and detached binary searches remain discrete in that path.
-- `fully_differentiable=True` switches the class to a continuous dense relaxation. Neighbor assignment is soft over the full query-corpus distance matrix rather than a hard k-NN index set; density weights use sigmoid counts; rho/sigma/epsilon are obtained with differentiable fixed-point/Newton iterations; graph pruning is a smooth gate rather than structural `nonzero()` pruning; movement and clipping are smooth; orphan handling is a continuous validity gate; and the shift loop does not use data-dependent early stopping. This removes the hard value/graph decisions that otherwise block gradients.
-- In the differentiable path, `temperature` is the single public relaxation/smoothness hyperparameter. Internal temperatures and solver budgets are derived automatically. The path is dense and therefore substantially more expensive than the sparse legacy path.
-- Label masks remain discrete by necessity: the label rule (`label_mode`) determines whether a point is an eligible neighbor. The differentiable path still uses the label mask as a fixed eligibility mask, but zero eligible mass is handled by a continuous validity gate rather than an `orphan_mask`/`torch.where` freeze.
-- `torch.compile` is used for suitable dense kernels. The first call for a new shape/configuration can include compilation and should not be used as a steady-state benchmark.
-- Scalar options are validated as one-element tensors, moved to `device`, and detached when fixed. A scalar becomes a learnable `torch.nn.Parameter` only when both its `learn_*` flag and `enable_gradients` are enabled; otherwise it is stored as a buffer.
-- In `fully_differentiable=True` reference-manifold mode, the reference tensor is kept connected to autograd and its density prior is recomputed inside the differentiable forward path, so gradients can propagate through both query and reference embeddings. In the legacy path, the reference manifold is detached and its density weights are cached when set.
-- The module logger is silent when `log_file=None`. When a path is supplied, it writes this module's messages to that file and disables propagation to console/root handlers.
+| Strategy | Options |
+| --- | --- |
+| `HardKNN` | `k` (must satisfy `1 <= k <= corpus size`, validated before the compiled `topk`), `soft_topk_temperature` (reweights selected neighbours by a sigmoid of their distance to the k-th neighbour; carries gradients to positions), `learn_soft_topk_temperature`, `chunk_size`, `device` |
+| `SoftKNN` | `k` (target membership mass per point, not a hard limit), `temperature`, `learn_temperature`, `solver_iterations`, `device` |
 
-## `MeanShiftDensityEnhancement` configuration
+### Weights (`msde.weights`)
 
-### Neighbor graph and geometry
+`compute(corpus) -> (m,)`. `cache_reference` says whether a fixed reference manifold's weights are computed once in `set_reference` (detached, no-grad) or recomputed every call.
 
-| Option | Configurations and effect | Use when / watch out |
-| --- | --- | --- |
-| `k` | Positive integer number of legacy shift neighbors. In hard k-NN mode it must not exceed the corpus size (`n` in self-shift mode or `m` in reference-manifold mode); invalid values raise `ValueError` before the compiled `topk` kernel runs. | Larger values smooth the legacy hard graph but increase its gather/graph cost. In fully differentiable mode, `k` controls the softness target of the continuous neighbor assignment rather than selecting exactly `k` hard indices. |
-| `n_neighbors` | Not a constructor option. The legacy density graph uses `15` neighbors and `200` fuzzy-set epochs. | Use `get_empirical_weights` directly when the standalone legacy density graph must use different internal settings. |
-| `recompute_neighbors` | Legacy path: `0`/`None` builds the graph once; positive `p` rebuilds periodically. | In fully differentiable mode there is no hard neighbor topology to rebuild; each shift iteration evaluates the continuous assignment directly. |
-| `X` | `None`: self-shift; `(m,d)` tensor/array: reference-manifold mode. | In fully differentiable mode the reference can remain connected to autograd. In the legacy path it is detached and cached. |
-| `labels` | Integer labels for the reference manifold; per-call labels are passed to `forward()`. When given, neighbors are restricted according to `label_mode`. | Label equality itself is discrete. Fully differentiable mode smooths values and geometry, but does not make class membership differentiable. |
-| `label_mode` | `"same_label"` (default): a point's neighbors must share its label. `"zero_label"`: every point's neighbors must have label `0`, whatever its own label (label-0 points use label-0 neighbors; labels 1, 2, 3, ... are pulled towards label 0). | Only applies when `forward()` receives `labels`. Works in both self-shift and reference-manifold mode; in reference mode the reference labels are checked. See [Label masking](#label-masking). |
+| Strategy | Options |
+| --- | --- |
+| `SparseEmpirical` (caches reference) | `nbd_sample_count_threshold`, `n_neighbors` (15), `n_epochs` (200), `max_iters_weight_count` (4), `satisfiability_proportion` (0.3), `use_chunking` / `chunk_size`, `temperature` (sigmoid counts when set, hard indicators when `None`), `eps`, `learn_temperature`, `learn_eps` (with `eps=None` the epsilon is initialised from the data on first use), `soft_prune` / `soft_prune_temperature`, `differentiable_eps` (chunked only) with `eps_count_temperature` / `eps_threshold_temperature` |
+| `SoftEmpirical` (recomputes) | `n_neighbors`, `n_epochs`, `nbd_sample_count_threshold`, `satisfiability_proportion`, `max_iters_weight_count`, `temperature`, `eps`, `learn_temperature`, `learn_eps` (requires explicit initial `eps`), `eps_threshold_temperature`, `solver_iterations` |
 
-### Weight computation
+### Step (`msde.step`)
 
-| Option | Configurations and effect | Use when / watch out |
-| --- | --- | --- |
-| `use_chunking` | Legacy path: chunked sparse graph processing vs dense baseline. | The fully differentiable path is dense by design; `use_chunking` does not turn it back into hard sparse k-NN. |
-| `weight_chunk_size` | Legacy streamed-pass chunk size. | Primarily relevant to the legacy path. |
-| `nbd_sample_count_threshold` | Density threshold used to determine the target neighborhood mass/radius. | Larger values generally broaden the density support. |
-| `satisfiability_proportion` | Legacy standalone proportion parameter; the class's differentiable path uses the same density-conditioning concept internally. | Most users can leave the default unchanged. |
-| `temperature` | The primary smoothness control. | For end-to-end training, use a positive value such as `0.05–0.2` and tune it based on gradient scale and how sharp you want neighbor assignments to be. |
-| `eps` | Optional fixed epsilon. | Supplying `eps` avoids epsilon solving. In fully differentiable mode, a fixed epsilon is still differentiable downstream with respect to embeddings and other learnable parameters. |
-| `learn_eps` | Makes epsilon learnable. | In fully differentiable mode, give an explicit initial `eps`; epsilon participates in the continuous computation graph. |
-| `differentiable_eps` and `eps_*_temperature` | Legacy advanced controls for the partially differentiable epsilon helper. | Do not use these in normal fully differentiable mode. |
-| `soft_prune` and `soft_prune_temperature` | Legacy advanced controls for sparse soft pruning. | Soft pruning is automatic in fully differentiable mode. |
+Two phases so the loop can reuse work between neighbour recomputations: `prepare(X, corpus, base_weights, neighbors) -> state` (on every recompute) and `step(X, corpus, state, gate) -> (X_new, change)` (every iteration).
 
-### Shift update
+| Strategy | Options |
+| --- | --- |
+| `PlainBarycenter` (accepts `"hard"`) | `learning_rate`, `alpha`, `learn_learning_rate`, `learn_alpha`, `clipping`, `clip_mode` (0 off, 1 saturating, 2 hard cap at `alpha` x median neighbour distance), `use_sparse_shift`, `low_precision_barycenter`, `smooth_movement_gate` |
+| `SoftBarycenter` (accepts `"soft"`) | `learning_rate`, `alpha`, `clipping`, `clip_mode` (1 saturating, 2 soft minimum), `temperature` (only used by `clip_mode=2`), `learn_*` flags. Smooth zero-movement gate and a continuous validity gate for points with no neighbour mass |
 
-| Option | Configurations and effect | Use when / watch out |
-| --- | --- | --- |
-| `learning_rate` | Scalar multiplier on the shift step. | Can be made learnable with `learn_learning_rate=True`. |
-| `learn_learning_rate` | Registers `learning_rate` as a parameter. | Useful for end-to-end optimization; keep the learned value in a sensible range. |
-| `alpha` | Clipping scale. | Only affects clipping. |
-| `learn_alpha` | Registers `alpha` as a parameter. | Useful when clipping is enabled and its scale should be learned. |
-| `clipping` | Enables step clipping. | In fully differentiable mode clipping remains smooth. |
-| `clip_mode` | Legacy mode selector; fully differentiable mode internally uses smooth clipping. | Use the legacy setting only when intentionally using the legacy path. |
-| `use_sparse_shift` | Legacy sparse-vs-gather representation choice. | Not the representation used by the fully differentiable path. |
-| `low_precision_barycenter` | Legacy gather-mode precision optimization. | Not used by the fully differentiable path. |
-| `max_iters_shift` | Number of shift iterations in the fixed differentiable loop. | More iterations mean a deeper autograd graph and higher compute/memory cost. |
-| `shift_threshold` | Legacy early-stop threshold. | Not used to terminate the fully differentiable loop. |
-| `gate` | Per-call multiplier on the shift step. | Useful for scaling one call without changing stored parameters. |
+### Loop (`msde.loop`)
 
-### Differentiability
+`ShiftLoop.run` is the shared skeleton: `preprocess` -> iterate (recompute neighbours / `prepare` on schedule, `step`, orphan freeze, trajectory) -> `postprocess`. Strategies override `should_recompute`, `converged`, `preprocess`, `postprocess`.
 
-| Option | Configurations and effect | Use when / watch out |
-| --- | --- | --- |
-| `fully_differentiable` | `False`: existing sparse/hard MSDE path. `True`: continuous dense end-to-end path. | Set this to `True` when gradients must flow through neighbor assignment, density estimation, graph weighting, pruning, and the iterative shift. |
-| `temperature` | Single public relaxation hyperparameter in fully differentiable mode. | Smaller values approximate sharper/harder decisions; larger values produce smoother gradients. |
-| `enable_gradients` | Preserves gradients when `True`; detaches the query input when `False`. | Keep `True` for end-to-end training. |
-| `learn_temperature` | Makes `temperature` a learnable parameter. | Useful when the model should learn its smoothness; constrain positivity in the optimizer if necessary. |
-| `keep_trajectory` | Stores the initial state and each completed differentiable shift step. | Can dominate memory because the trajectory retains `(I_s+1)*n*d` values. |
-| `log_file` | Enables module logging when a path is supplied. | Logging is disabled by default. |
+| Strategy | Options |
+| --- | --- |
+| `EarlyStopLoop` | `max_iters_shift`, `shift_threshold` (stop when mean movement is below it; a data-dependent `.item()` branch), `recompute_neighbors` (`0`/`None`: once; positive `p`: at iterations 0, p, 2p, ...), `keep_trajectory` |
+| `FixedLoop` | `max_iters_shift`, `recompute_neighbors` (default 1: every iteration), `keep_trajectory`. No data-dependent branching, so the graph has fixed control flow |
 
-### What `fully_differentiable=True` changes
+## `MeanShiftDensityEnhancement` options
 
-The strict differentiable path removes the main value/graph discontinuities from the numerical computation:
+`neighbors`, `weights`, `step`, `loop` (components), plus:
 
-1. **Neighbor selection:** continuous soft assignment over the full query-corpus distance matrix replaces hard `topk`.
-2. **Density counts:** sigmoid radius counts replace `(distance < epsilon)`.
-3. **Density parameters:** rho, sigma, and epsilon use fixed differentiable solver iterations rather than hard bisection control flow.
-4. **Pruning:** no data-dependent sparse `nonzero()` selection is used; edge weights are smoothly gated.
-5. **Movement:** the zero-movement safeguard is continuous.
-6. **Clipping:** minimum-like behavior is smoothed.
-7. **Orphans:** zero-neighbor mass is handled by a continuous validity factor instead of a hard freeze.
-8. **Iteration control:** the differentiable shift loop runs a fixed number of iterations; mean movement is logged but does not determine execution.
+| Option | Effect |
+| --- | --- |
+| `X` | `None`: self-shift. `(m,d)`: reference-manifold mode; every `forward` input is shifted against this fixed corpus. Settable later with `set_reference_manifold(X, labels=None)`. |
+| `labels` | Integer labels for the reference manifold; per-call labels go to `forward(X, gate=1.0, labels=None)`. |
+| `label_mode` | `"same_label"` (default) or `"zero_label"`; see [Label masking](#label-masking). |
+| `reference_grad` | Keep autograd history on the reference tensor (default `False`: detached). Pair with a non-caching weights strategy such as `SoftEmpirical`, which recomputes the reference prior every call so gradients reach both queries and reference. |
+| `enable_gradients` | `False` detaches `forward`'s input and freezes existing component parameters. |
+| `gate` (per call) | Multiplier on the shift step for that call. |
+| `log_file` | Logging is silent when `None`; with a path, this package's messages are written there and propagation to root handlers is disabled. |
 
-The class therefore exposes a deliberately small public interface:
-
-```python
-model = MeanShiftDensityEnhancement(
-    k=30,
-    temperature=0.1,
-    fully_differentiable=True,
-)
-```
-
-There is normally no need to specify soft-top-k temperature, pruning temperature, epsilon-count temperature, epsilon-threshold temperature, or solver iteration count.
-
-## Reference-manifold mode
-
-```python
-# Fully differentiable reference mode
-reference = torch.randn(50_000, 128, device="cuda", requires_grad=True)
-
-model = MeanShiftDensityEnhancement(
-    X=reference,
-    k=30,
-    temperature=0.1,
-    fully_differentiable=True,
-    device="cuda",
-)
-
-queries = torch.randn(2_000, 128, device="cuda", requires_grad=True)
-
-shifted, movement, _ = model(queries)
-
-loss = shifted.square().mean()
-loss.backward()
-```
-
-In fully differentiable reference mode, the reference manifold remains connected to autograd and its density prior is recomputed as part of the differentiable forward computation. Therefore gradients can propagate into both `queries` and `reference`.
-
-In the legacy reference mode, the reference manifold is detached and its empirical density weights are computed when the reference is set.
-
-Labels still represent discrete class membership. When labels are supplied, ineligible reference points (other-label points for `same_label`, non-zero-label points for `zero_label`) are excluded by a fixed eligibility mask; the geometry and weighting remain differentiable with respect to the floating-point inputs.
+`model.learnable_parameters` collects every learnable scalar, keyed `"<component>.<name>"` (e.g. `"neighbors.temperature"`). A scalar is a `torch.nn.Parameter` only when its `learn_*` flag is set, else a buffer. Passing an existing `nn.Parameter` as a value registers that very object, so one learnable temperature can be shared across components.
 
 ## Label masking
 
-Labels passed to `forward(X, labels=y)` restrict which corpus points (X itself, or `X_ref` in reference mode) can be neighbors:
+Labels passed to `forward(X, labels=y)` restrict which corpus points (X itself, or `X_ref` in reference mode) can be neighbours:
 
 | `label_mode` | Point with label 0 | Point with label 1, 2, 3, ... |
 | --- | --- | --- |
-| `"same_label"` (default) | label-0 neighbors | neighbors with its own label |
-| `"zero_label"` | label-0 neighbors | label-0 neighbors |
+| `"same_label"` (default) | label-0 neighbours | neighbours with its own label |
+| `"zero_label"` | label-0 neighbours | label-0 neighbours |
 
 ```python
-model = MeanShiftDensityEnhancement(k=30, label_mode="zero_label")
+model = MeanShiftDensityEnhancement(label_mode="zero_label")
 shifted, movement, _ = model(X, labels=y)   # every point shifts towards label-0 points
 ```
 
-How the mask is applied:
+- Reference mode: if the reference has labels, per-call labels are optional (omit them for an unmasked shift); if it has none, passing labels is an error.
+- `HardKNN`: cross-class distances are set to `inf` before `topk`. With fewer than `k` eligible points the extras get zero weight; with none, the point is an orphan and the loop leaves it unmoved.
+- `SoftKNN`: membership is multiplied by the eligibility mask with target mass `min(eligible count, k)`; with no eligible mass `SoftBarycenter`'s validity gate scales the step to zero.
+- `k` is validated against the unmasked corpus size.
+- Density weights are not masked; only neighbour eligibility depends on labels.
+- Label equality is discrete by necessity; the geometry and weighting stay differentiable.
+- `zero_label` needs label-0 points in the corpus; otherwise every point is an orphan and nothing moves.
 
-- **Legacy path:** the chunked k-NN kernel sets the distance to `inf` wherever the query and corpus labels don't match, then takes `topk`. `zero_label` replaces every query label with `0` before the comparison, so the test becomes `corpus_label == 0`.
-- **Fewer than `k` eligible points:** `topk` still returns `k` indices; the ineligible extras get zero weight.
-- **No eligible points:** the point is an orphan and is left unmoved for that call (legacy path), or its step is scaled to zero by the continuous validity gate (fully differentiable path).
-- **Corpus-size constraint:** `k` is validated against the total corpus size before masking. A label mask can reduce the number of effective neighbors, but it cannot make an invalid `k` valid; `k` must still be no greater than the unmasked corpus size.
-- **Density weights are not masked:** they are computed on the full X (or full `X_ref`); only neighbor eligibility depends on labels.
-- **Self-neighbors:** in self-shift mode an eligible point is its own nearest neighbor in the legacy path. Under `zero_label` this applies only to label-0 points.
-- **Fully differentiable path:** the soft k-NN membership is multiplied by the same eligibility mask, with the target mass set to `min(eligible count, k)`.
+## Writing a new strategy
 
-## Standalone components
-
-These functions remain available for profiling or custom pipelines:
-
-- `torch_knn(X, k, corpus=None, labels=None, corpus_labels=None)`: exact legacy chunked k-NN; returns hard indices and distances.
-- `compute_fixed_knn(...)`: same hard legacy search, returning only indices.
-- `fuzzy_simplicial_set_torch(...)`: legacy sparse fuzzy-graph COO builder.
-- `get_empirical_weights(...)`: legacy density-weight pipeline.
-- `compute_weights_from_similarity_chunked(...)`: legacy streamed sparse density weighting.
-- `compute_weights_from_similarity_dense(...)`: legacy dense baseline.
-- `radius_counts_chunked(...)`: legacy radius counting; positive `temperature` selects sigmoid counts, while `temperature=None` uses hard indicators.
-
-For end-to-end differentiability, prefer the `MeanShiftDensityEnhancement(..., fully_differentiable=True)` class path rather than assembling these legacy hard/sparse components manually.
-
-## Practical recipes
-
-### Small, fast baseline
+Subclass the component's base class and override the documented methods; nothing else changes. A step that never moves points:
 
 ```python
-model = MeanShiftDensityEnhancement(
-    k=15,
-    max_iters_shift=3,
-    use_chunking=False,
-    use_sparse_shift=False,
-    device="cuda",
-)
+from msde import MovementStep
+
+class Frozen(MovementStep):
+    accepts = "hard"                      # which Neighbors form it consumes
+
+    def prepare(self, X, corpus, base_weights, neighbors):
+        return None                       # opaque state reused by step()
+
+    def step(self, X, corpus, state, gate=1.0):
+        return X, torch.zeros(X.shape[0], dtype=X.dtype, device=X.device)
 ```
 
-Use this legacy configuration when speed and sparse graph structure matter more than differentiating through graph construction.
-
-### Large dataset with bounded working memory
+Use `self.register_scalar(name, value, learnable, device)` (from `ParametrizedModule`, the shared base) for hyperparameters that may be learnable. Loop pre/post-processing:
 
 ```python
-model = MeanShiftDensityEnhancement(
-    k=30,
-    use_chunking=True,
-    weight_chunk_size=1024,
-    use_sparse_shift=True,
-    recompute_neighbors=0,
-    device="cuda",
-)
+class Doubling(EarlyStopLoop):
+    def postprocess(self, result, ctx):
+        shifted, dist, trajectory = result
+        return shifted * 2, dist, trajectory
 ```
 
-This is still the legacy sparse path. Chunking controls peak working memory but does not change its all-corpus asymptotic search cost.
+## Standalone functions
 
-### End-to-end differentiable objective
-
-```python
-model = MeanShiftDensityEnhancement(
-    k=30,
-    temperature=0.1,
-    fully_differentiable=True,
-)
-
-shifted, movement, _ = model(X)
-
-loss = loss_fn(shifted)
-loss.backward()
-```
-
-This is the recommended API for learning an upstream encoder jointly with MSDE. `temperature` is the main additional hyperparameter to tune.
-
-### Learning the MSDE hyperparameters too
-
-```python
-model = MeanShiftDensityEnhancement(
-    k=30,
-    temperature=0.1,
-    learning_rate=0.3,
-    alpha=0.5,
-    fully_differentiable=True,
-    learn_temperature=True,
-    learn_learning_rate=True,
-    learn_alpha=True,
-)
-```
-
-All three scalars can then receive gradients from the downstream objective.
-
-## Cost model for the fully differentiable path
-
-The continuous relaxation removes the hard top-k bottleneck by evaluating query-corpus distances densely.
-
-For query size `n`, corpus size `m`, and feature dimension `d`:
-
-- Dense distance construction: approximately `O(n*m*d)` time and `O(n*m)` distance memory.
-- Continuous neighbor assignment and density weighting: additional `O(n*m)`–scale tensor work.
-- Shift iteration: approximately `O(I_s*n*m*d)` when each iteration evaluates the continuous query-corpus geometry.
-- Peak autograd memory can be substantially larger than forward working memory because intermediate tensors from every differentiable iteration may be retained.
-
-For self-shift, `m=n`, so the dominant cost is quadratic in the number of points.
-
-This is the fundamental trade-off for obtaining gradients through neighbor membership: a genuinely continuous relaxation cannot preserve the exact sparse `O(n*k)` graph structure at the same time.
+For profiling or custom pipelines: `msde.common.knn` (`torch_knn`, `compute_fixed_knn`, `masked_soft_knn_weights`), `msde.common.graph` (`fuzzy_simplicial_set_torch`, `soft_fuzzy_graph`), `msde.common.eps` (`radius_counts_chunked`, `calculate_eps_from_similarity`, `smooth_epsilon_from_graph`), and `msde.weights.sparse` (`get_empirical_weights`, `compute_weights_from_similarity_chunked`, `compute_weights_from_similarity_dense`).
 
 ## Failure modes and checks
 
-- `fully_differentiable=True` requires floating-point feature tensors and uses a positive temperature.
-- Hard k-NN validates `1 <= k <= corpus_size` before calling `torch.topk`; this applies to self-shift and reference-manifold mode. In a masked run, the corpus size is still the total unmasked corpus size.
-- `k` still controls the target neighbor mass of the continuous assignment; it is not a hard limit on the number of candidates considered.
-- `learn_temperature=True` requires an initial temperature or uses the differentiable-mode default when appropriate.
-- `learn_eps=True` in fully differentiable mode requires an explicit initial `eps`.
-- Reference and query feature dimensions must match.
-- Label tensors must be integer-like and aligned with their corresponding points.
-- `label_mode="zero_label"` requires label-0 points in the corpus; without them every point is an orphan and nothing moves.
-- Label equality remains discrete; only the geometric/weight computation is relaxed.
-- The differentiable path deliberately avoids data-dependent early stopping so that the autograd graph has fixed control flow.
-- Dense continuous computation can become prohibitively expensive for large `n` or `m`; use the legacy sparse path when full graph-construction gradients are unnecessary.
-- Benchmark after the first call for each relevant shape because compiled kernels may compile lazily.
+- `HardKNN` validates `1 <= k <= corpus_size` before calling `torch.topk`; in a masked run the corpus size is still the unmasked total.
+- Soft strategies require a positive `temperature`; `learn_eps=True` in `SoftEmpirical` requires an explicit initial `eps`; `learn_temperature=True` needs an initial temperature.
+- `SparseEmpirical(differentiable_eps=True)` requires `use_chunking=True`.
+- A `neighbors`/`step` pair with different forms raises `ValueError` at construction.
+- Reference and query feature dimensions must match; label tensors must be integer-like, 1-D and aligned with their points.
+- Dense soft computation can be prohibitively expensive for large `n` or `m`; use the hard/sparse components when gradients through graph construction are unnecessary.
+- Benchmark after the first call per shape: compiled kernels compile lazily.
