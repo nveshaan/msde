@@ -1,6 +1,9 @@
 """Generate regression fixtures from the pre-refactor monolith (src/msde.py).
 
-Run once on the old code: `uv run python tests/make_fixtures.py`.
+Historical: fixtures.pt was generated once, at the commit that added it, with
+`PYTHONPATH=. uv run python tests/make_fixtures.py`. The monolith has since been
+split into the msde/ package (see git history), so this script no longer runs
+on the current tree; tests/test_regression.py is what consumes fixtures.pt.
 """
 import torch
 from src.msde import MeanShiftDensityEnhancement
