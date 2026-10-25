@@ -44,9 +44,10 @@ class WhitenedKNN(ChunkedKNN):
         cov = (Xc.T @ Xc) / max(n - 1, 1)
         # The d x d eigendecomposition is tiny; do it on the CPU in float64
         # (not every device implements eigh, and float32 loses small eigenvalues).
-        evals, evecs = torch.linalg.eigh(cov.to("cpu", torch.float64))
+        # Move first, then upcast: MPS cannot convert to float64, not even on the way to the CPU.
+        evals, evecs = torch.linalg.eigh(cov.cpu().double())
         evals = evals.clamp_min(0.0)
         ridge = self.regularization * evals.mean()
         scale = (evals + ridge).clamp_min(torch.finfo(torch.float64).tiny).rsqrt()
-        W = (evecs * scale).to(device=X.device, dtype=X.dtype)      # PCA rotation, then unit-variance scaling
+        W = (evecs * scale).to(X.dtype).to(X.device)                 # PCA rotation, then unit-variance scaling (cast before moving, for MPS)
         return Xc @ W
