@@ -92,6 +92,12 @@ def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192, labels=None, corpus_
             dists, idx = chunk_kernel(X[start:end], X_full, labels[start:end], full_labels)
         else:
             dists, idx = chunk_kernel(X[start:end], X_full)
+        # A point's distance to itself is exactly 0. The matmul-based cdist leaves
+        # rounding noise there (~1e-3), which is platform-dependent and would be
+        # mistaken for the nearest-neighbour distance (rho) by the fuzzy graph.
+        # Entries the label mask set to inf are not self-matches and stay inf.
+        rows = torch.arange(start, end, device=idx.device).unsqueeze(1)
+        dists = dists.masked_fill((idx == rows) & torch.isfinite(dists), 0.0)
         all_idx[start:end] = idx
         all_dist[start:end] = dists
 
