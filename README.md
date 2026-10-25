@@ -18,7 +18,7 @@ msde/
   neighbors/       NeighborSelector -> EuclideanKNN, CosineKNN, WhitenedKNN, JointKNN
   weights/         DensityWeights   -> SparseEmpirical, KDEWeights, GravityWeights, UniformWeights
   step/            MovementStep     -> PlainBarycenter, GravityBarycenter
-  loop/            ShiftLoop        -> EarlyStopLoop
+  loop/            ShiftLoop        -> EarlyStopLoop, NormalizedLoop
   common/          code shared by more than one component
   config.py        build a model from a YAML experiment config
 configs/           ready-made experiment configs (default, KDE + cosine, gravity ablation)

@@ -1,4 +1,4 @@
-from .loop import EarlyStopLoop, LoopContext, ShiftLoop
+from .loop import EarlyStopLoop, LoopContext, NormalizedLoop, ShiftLoop
 from .module import MeanShiftDensityEnhancement, mean_shift_density_enhancement
 from .neighbors import CosineKNN, EuclideanKNN, JointKNN, NeighborSelector, Neighbors, WhitenedKNN
 from .step import GravityBarycenter, MovementStep, PlainBarycenter
@@ -9,5 +9,5 @@ __all__ = [
     "NeighborSelector", "Neighbors", "EuclideanKNN", "CosineKNN", "WhitenedKNN", "JointKNN",
     "DensityWeights", "SparseEmpirical", "KDEWeights", "GravityWeights", "UniformWeights",
     "MovementStep", "PlainBarycenter", "GravityBarycenter",
-    "ShiftLoop", "EarlyStopLoop", "LoopContext",
+    "ShiftLoop", "EarlyStopLoop", "NormalizedLoop", "LoopContext",
 ]

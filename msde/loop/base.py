@@ -27,8 +27,15 @@ class ShiftLoop(ScalarModule):
     """Drives the neighbours -> step iteration.
 
     ``run`` is the shared skeleton; strategies override the policy hooks
-    (``should_recompute``, ``converged``) and the ``preprocess`` /
-    ``postprocess`` hooks, which wrap the iteration and default to identity.
+    (``should_recompute``, ``converged``) and the transform hooks, all of which
+    default to identity:
+
+    - ``preprocess(X)`` -- once, before the density weights are computed (so the
+      weights see the preprocessed points);
+    - ``before_shift(X, iter_count, ctx)`` -- at the start of every iteration,
+      before neighbours are selected;
+    - ``after_shift(X, X_new, change, ctx)`` -- after every step;
+    - ``postprocess(result, ctx)`` -- once, on ``(shifted, total_distance, trajectory)``.
     """
 
     def __init__(self, max_iters_shift=5, recompute_neighbors=0, keep_trajectory=False):
@@ -56,9 +63,17 @@ class ShiftLoop(ScalarModule):
     def converged(self, change):
         return False
 
-    def preprocess(self, X, ctx):
-        """Transform the points before shifting (default: identity)."""
+    def preprocess(self, X):
+        """Transform the points once, before the weights are computed (default: identity)."""
         return X
+
+    def before_shift(self, X, iter_count, ctx):
+        """Transform the points at the start of an iteration (default: identity)."""
+        return X
+
+    def after_shift(self, X, X_new, change, ctx):
+        """Adjust a step's ``(X_new, change)`` given the points ``X`` it started from (default: identity)."""
+        return X_new, change
 
     def postprocess(self, result, ctx):
         """Transform ``(shifted, total_distance, trajectory)`` (default: identity)."""
@@ -67,7 +82,6 @@ class ShiftLoop(ScalarModule):
     @torch.no_grad()
     def run(self, X, ctx):
         """Return ``(shifted_dataset, total_distance, trajectory)``."""
-        X = self.preprocess(X, ctx)
         masked = ctx.query_labels is not None
 
         shifted = X.clone()
@@ -78,6 +92,8 @@ class ShiftLoop(ScalarModule):
         orphan_mask = None    # (n,) bool -- points with zero valid neighbours at the last recompute
 
         for iter_count in range(self.max_iters_shift):
+            shifted = self.before_shift(shifted, iter_count, ctx)
+
             if self.should_recompute(iter_count):
                 neighbors = ctx.neighbors.select(
                     shifted,
@@ -89,6 +105,7 @@ class ShiftLoop(ScalarModule):
                 orphan_mask = neighbors.orphan_mask
 
             revised, change = ctx.step.step(shifted, state, ctx.gate)
+            revised, change = self.after_shift(shifted, revised, change, ctx)
 
             if orphan_mask is not None and orphan_mask.any():
                 revised = torch.where(orphan_mask.unsqueeze(1), shifted, revised)

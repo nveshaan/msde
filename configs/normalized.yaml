@@ -1,0 +1,29 @@
+# MSDE on the unit sphere: points are normalised before every shift.
+# On unit vectors Euclidean and cosine k-NN give identical neighbours and run at
+# the same speed; Euclidean is the cheaper choice (and the faster step kernel).
+vars:
+  k: 30
+
+device: auto
+
+neighbors:
+  name: EuclideanKNN
+  k: ${vars.k}
+  exclude_self: true
+
+weights:
+  name: KDEWeights
+  bandwidth: scott
+
+step:
+  name: GravityBarycenter
+  eta: 0.3
+  h: auto
+  metric: euclidean
+
+loop:
+  name: NormalizedLoop
+  max_iters_shift: 5
+  recompute_neighbors: 1     # neighbours follow the points on the sphere
+  tangent_projection: false  # true: shift only along the sphere (see DOC.md)
+  normalize_output: true     # return unit vectors

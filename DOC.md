@@ -80,11 +80,17 @@ Two phases so the loop can reuse work between neighbour recomputations: `prepare
 
 ### Loop (`msde.loop`)
 
-`ShiftLoop.run` is the shared skeleton: `preprocess` -> iterate (recompute neighbours / `prepare` on schedule, `step`, orphan freeze, trajectory) -> `postprocess`. Strategies override `should_recompute`, `converged`, `preprocess`, `postprocess`.
+`ShiftLoop.run` is the shared skeleton: iterate (`before_shift`, recompute neighbours / `prepare` on schedule, `step`, `after_shift`, orphan freeze, trajectory) -> `postprocess`. Strategies override the policy hooks `should_recompute` and `converged`, and the transform hooks, which all default to identity:
+
+- `preprocess(X)`: once, *before the weights are computed*, so the weights see the preprocessed points;
+- `before_shift(X, iter_count, ctx)`: at the start of every iteration, before neighbours are selected;
+- `after_shift(X, X_new, change, ctx)`: after every step;
+- `postprocess((shifted, total_distance, trajectory), ctx)`: once, at the end.
 
 | Strategy | Options |
 | --- | --- |
 | `EarlyStopLoop` | `max_iters_shift`, `shift_threshold` (stop when mean movement is below it), `recompute_neighbors` (`0`/`None`: once; positive `p`: at iterations 0, p, 2p, ...), `keep_trajectory` |
+| `NormalizedLoop` | Everything `EarlyStopLoop` takes, plus `tangent_projection=False`, `normalize_output=False`, `eps=1e-12`. Runs on the unit sphere: normalises the input (so the density weights are computed on the sphere too) and again before every shift. `tangent_projection` removes the radial component of each shift; `normalize_output` also returns unit vectors (otherwise points end just inside the sphere after the last shift). A zero vector stays zero. |
 
 ## `MeanShiftDensityEnhancement` options
 
@@ -159,6 +165,22 @@ Decisions the spec left open:
 - **Neighbours are fixed** between recomputations while distances in the kernel follow the current positions; set `recompute_neighbors=1` on the loop to refresh the neighbour set every iteration.
 - **Normalise embeddings** after shifting yourself if the downstream model needs unit length, and consider `metric="cosine"` for unit-normalised embeddings.
 
+## Working on the unit sphere
+
+`NormalizedLoop` normalises the points before every shift. Two questions come up, measured on unit vectors (k = 30, Linux CPU and Apple MPS):
+
+**Euclidean or cosine neighbours?** The same neighbours, at the same speed, so choose Euclidean.
+- For unit vectors `||x - y||^2 = 2 - 2 cos(x, y)` is monotone in the cosine, so `EuclideanKNN` and `CosineKNN` returned identical neighbour sets in every run (n up to 32,000, d = 64 and 512).
+- The search itself is a distance matrix plus top-k, and the metric changes neither: the times matched within noise (cosine / Euclidean = 0.96-1.16 on CPU, 0.99-1.00 on MPS).
+- The metric inside `GravityBarycenter` does matter: the Euclidean kernel was 1.6-1.9x faster than the cosine one on CPU and about 1.5x on MPS. On the sphere the two distances carry the same information, so use `metric="euclidean"` there too. The kernel bandwidth `h` is on a different scale for the two (cosine distance is half the squared Euclidean distance), so `h` does not carry over.
+- `CosineKNN` is still the right choice when the vectors are *not* normalised and you want scale-free neighbours.
+
+**Does projecting the shift onto the tangent matter?** A little, in a predictable way.
+- A step `x' = x + eta (mu - x)` toward a mean `mu` of unit vectors has a radial component `mu . x - 1 <= 0`, so it cuts inside the sphere (mean radial component -0.044 in one step on random data; points ended at norm 0.85-1.0). With `tangent_projection=True` the shift is orthogonal to `x` and the point stays on the sphere to first order (it ends slightly outside, at norm up to ~1.02).
+- Because the next iteration renormalises, the inward part is thrown away anyway. What is left is a difference in step *size*: the projected step keeps weight `1 - eta (mu . x)` on `x` where the plain step keeps `1 - eta`, so it moves a bit less. The gap grows with the angular spread of the neighbourhood and vanishes for tight ones.
+- Measured (n = 2000, d = 16, four clusters, 5 iterations, plain barycenter with lr 0.3): the first step is 5% shorter in angle for k = 5 (neighbourhood angle 33 deg), 8% for k = 80 (42 deg) and 11% for k = 320 (50 deg). After 5 iterations the two results differ by 0.7-1.0 deg on average, and the projected run is slightly less contracted: mean angle to the cluster centre 26.2 vs 26.0 deg at k = 5, and 11.9 vs 10.9 deg at k = 320. The gravity step behaves the same.
+- So with renormalisation the projection is nearly equivalent to using a slightly smaller step size, and a plain `eta` / learning rate can absorb it. It is more than cosmetic if you do *not* renormalise between shifts (the radial loss then compounds and points collapse toward the origin), or if you want to read the reported movement as a pure angular distance: with `tangent_projection=True` the reported movement is scaled by the fraction of the shift that was kept, so the early-stopping threshold stays comparable.
+
 ## Experiment configs
 
 A model can be described in a YAML file instead of code, which makes experiments easy to version, diff and sweep. The loader uses `omegaconf` (already a dependency).
@@ -195,6 +217,7 @@ Shipped configs, all in `configs/`:
 | --- | --- |
 | `default.yaml` | The original behaviour, with every option and its alternatives listed |
 | `kde_cosine.yaml` | Gaussian-KDE density with cosine neighbours |
+| `normalized.yaml` | MSDE on the unit sphere with `NormalizedLoop` |
 | `ablation/1_distance_only.yaml` | Gravity study 1: distance-only selection and attraction |
 | `ablation/2_approach1.yaml` | Gravity study 2 (Approach 1): distance-only selection, density/stability-weighted attraction |
 | `ablation/3_approach2.yaml` | Gravity study 3 (Approach 2): joint selection and attraction |

@@ -81,6 +81,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             corpus_labels = as_label_tensor(labels, X.shape[0], self.device_name)
             query_labels = self.label_policy.query_labels(corpus_labels)
 
+        X = self.loop.preprocess(X)
         ctx = LoopContext(
             neighbors=self.neighbors,
             step=self.step,
