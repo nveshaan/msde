@@ -6,8 +6,8 @@ It is built from **four swappable components**, each with a base class and one o
 
 | Component | Base class | Question it answers | Strategies |
 | --- | --- | --- | --- |
-| `msde.neighbors` | `NeighborSelector` | Which points is each point pulled towards? | `EuclideanKNN`, `CosineKNN` |
-| `msde.weights` | `DensityWeights` | How typical/dense is each point? | `SparseEmpirical` |
+| `msde.neighbors` | `NeighborSelector` | Which points is each point pulled towards? | `EuclideanKNN`, `CosineKNN`, `WhitenedKNN` |
+| `msde.weights` | `DensityWeights` | How typical/dense is each point? | `SparseEmpirical`, `KDEWeights` |
 | `msde.step` | `MovementStep` | How does a point move towards the weighted barycenter? | `PlainBarycenter` |
 | `msde.loop` | `ShiftLoop` | How is the iteration run (schedule, stopping, pre/post-processing)? | `EarlyStopLoop` |
 
@@ -36,8 +36,9 @@ Every component is optional; omitted ones default to the combination above. `shi
 ## Notation and cost model
 
 - `n`: points; `d`: feature dimension; `k`: shift neighbours; `q`: `SparseEmpirical.n_neighbors` (default 15); `c`: chunk size; `I_s`: shift iterations; `r`: neighbour rebuilds (`r=1` for `recompute_neighbors=0`, else `<= ceil(I_s/p)`).
-- `EuclideanKNN` / `CosineKNN`: `O(n^2*d)` time even when chunked; `O(c*n + n*k)` working space.
+- `EuclideanKNN` / `CosineKNN` / `WhitenedKNN`: `O(n^2*d)` time even when chunked; `O(c*n + n*k)` working space. `WhitenedKNN` adds `O(n*d^2 + d^3)` for the covariance and its eigendecomposition.
 - `SparseEmpirical`: the k-NN stage is `O(n^2*d)`; the fuzzy graph has `E ~ 2*n*q` edges. Each graph row is an `n`-dimensional sparse vector, so one chunked radius-count pass costs `O(E*n) = O(n^2*q)` time (a sparse-times-dense matmul per chunk) with `O(c*n)` working space. The pipeline runs about 20 such passes: one min/max pass, a bisection for epsilon (`~log2(range/1e-4)`, at most 50, plus a relaxed retry when it fails) and `max_iters_weight_count` weight passes. Total `O(n^2*(d + P*q))` with `P ~ 20`. The dense variant materialises `S` and calls `cdist` on `n`-dimensional rows: `O(n^3)` time and `O(n^2)` memory.
+- `KDEWeights`: `O(n^2*d)` time and `O(c*n)` working space, i.e. one pairwise-distance pass. This is the cost of `SparseEmpirical`'s k-NN stage alone, without its `O(P*n^2*q)` graph-space counting.
 - `PlainBarycenter`: sparse mode ~`O(n^2*d)`; gather mode `O(n*k*d)`; clipping adds `O(n*k*d)`.
 - `torch.compile` is used for dense kernels; the first call for a new shape/configuration includes compilation, so do not benchmark it.
 
@@ -51,8 +52,9 @@ Every component is optional; omitted ones default to the combination above. `shi
 | --- | --- |
 | `EuclideanKNN` | `k` (must satisfy `1 <= k <= n`, validated before the compiled `topk`), `chunk_size`, `device`. Ranks by Euclidean distance. |
 | `CosineKNN` | Same options. Ranks by cosine distance `1 - cos(x, y)` (in `[0, 2]`), so it ignores each point's scale; `Neighbors.dist` holds cosine distances. Only the neighbour choice changes: density weights and the movement step still work in the original feature space. |
+| `WhitenedKNN` | `k`, `chunk_size`, `device`, `regularization` (ridge on the covariance eigenvalues, relative to their mean; default `1e-6`). Centres and whitens the points with their covariance, then searches by Euclidean distance, i.e. ranks by Mahalanobis distance; `Neighbors.dist` holds Mahalanobis distances. The ranking is invariant to invertible linear maps of the features. The covariance is estimated from all points on every `select` call (so it follows the shifting points), regardless of labels. The ridge keeps degenerate directions (fewer points than features, constant columns) from being amplified, but it is not basis-invariant: lower it (e.g. `1e-9`) for very ill-conditioned data. The `d x d` eigendecomposition runs on the CPU in float64. |
 
-Both share `ChunkedKNN` (`msde.neighbors.chunked`), which only needs a `metric` key from `msde.common.knn.METRICS`; add a metric there and a two-line subclass to get a new one.
+All three share `ChunkedKNN` (`msde.neighbors.chunked`): a subclass sets a `metric` key from `msde.common.knn.METRICS` and may override `transform(X)` to search in a transformed space (`WhitenedKNN` does).
 
 ### Weights (`msde.weights`)
 
@@ -61,6 +63,7 @@ Both share `ChunkedKNN` (`msde.neighbors.chunked`), which only needs a `metric` 
 | Strategy | Options |
 | --- | --- |
 | `SparseEmpirical` | `nbd_sample_count_threshold`, `n_neighbors` (15), `n_epochs` (200), `max_iters_weight_count` (4), `satisfiability_proportion` (0.3), `use_chunking` / `chunk_size`, `eps` (fixed radius; otherwise found by bisection), `device` |
+| `KDEWeights` | `bandwidth` (a positive number, or `"scott"` (default) / `"silverman"` computed from the data on each call), `chunk_size`, `device`. Gaussian KDE with leave-one-out: `weight_i = sum_{j != i} exp(-\|x_i - x_j\|^2 / 2h^2)`, an unnormalised soft neighbour count in `[0, n-1]`, on the same scale as `SparseEmpirical`'s counts. In high dimensions the rules give `h` close to the per-feature spread, so the estimate is very smooth; pass a number to sharpen it. |
 
 ### Step (`msde.step`)
 

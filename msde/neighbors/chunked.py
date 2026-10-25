@@ -7,7 +7,8 @@ from .base import NeighborSelector, Neighbors
 
 class ChunkedKNN(NeighborSelector):
     """Exact chunked top-k neighbours under a distance ``metric``, optionally
-    restricted by labels. Subclasses only set ``metric``."""
+    restricted by labels. Subclasses set ``metric`` and may override
+    ``transform`` to search in a transformed space."""
 
     metric = None   # a key of common.knn.METRICS
 
@@ -17,10 +18,14 @@ class ChunkedKNN(NeighborSelector):
         self.device_name = device
         self.chunk_size = chunk_size
 
+    def transform(self, X):
+        """The points the search runs on (default: ``X`` itself)."""
+        return X
+
     @torch.no_grad()
     def select(self, X, labels=None, corpus_labels=None):
         indices, dist = torch_knn(
-            X, self.k, device=self.device_name, chunk_size=self.chunk_size,
+            self.transform(X), self.k, device=self.device_name, chunk_size=self.chunk_size,
             labels=labels, corpus_labels=corpus_labels, metric=self.metric,
         )
 

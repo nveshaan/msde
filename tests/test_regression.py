@@ -143,3 +143,135 @@ def test_unknown_metric_rejected():
     X, _ = make_data()
     with pytest.raises(ValueError, match="metric"):
         torch_knn(X, 3, device=DEVICE, metric="manhattan")
+
+
+def _kde_bruteforce(X, h):
+    X = X.double()
+    d2 = (X[:, None, :] - X[None, :, :]).square().sum(-1)
+    k = torch.exp(-d2 / (2 * h * h))
+    return k.sum(1) - 1.0                      # leave-one-out: drop the point's own exp(0)
+
+
+def test_kde_matches_bruteforce_and_is_chunk_invariant():
+    from msde import KDEWeights
+
+    X, _ = make_data()
+    expected = _kde_bruteforce(X, 1.5)
+    for chunk in (7, 64, 10_000):
+        w = KDEWeights(bandwidth=1.5, chunk_size=chunk, device=DEVICE).compute(X)
+        torch.testing.assert_close(w.double(), expected, atol=1e-3, rtol=1e-4)
+    assert w.min() >= 0 and w.max() <= X.shape[0] - 1
+
+
+def test_kde_leave_one_out_isolated_point():
+    from msde import KDEWeights
+
+    X = torch.zeros(5, 3)
+    X[4] = 1000.0                               # far from everyone
+    w = KDEWeights(bandwidth=1.0, device=DEVICE).compute(X)
+    assert w[4] < 1e-6                          # not credited with its own kernel
+    torch.testing.assert_close(w[:4], torch.full((4,), 3.0))   # 3 coincident others
+
+
+def test_kde_bandwidth_rules_and_validation():
+    from msde import KDEWeights
+
+    X, _ = make_data()
+    n, d = X.shape
+    s = X.std(dim=0).mean().item()
+    scott = KDEWeights("scott", device=DEVICE).resolve_bandwidth(X)
+    silverman = KDEWeights("silverman", device=DEVICE).resolve_bandwidth(X)
+    assert abs(scott - s * n ** (-1 / (d + 4))) < 1e-6
+    assert abs(silverman - s * (n * (d + 2) / 4) ** (-1 / (d + 4))) < 1e-6
+    assert KDEWeights(0.7, device=DEVICE).resolve_bandwidth(X) == 0.7
+    for bad in ("nope", 0, -1.0, float("nan"), True):
+        with pytest.raises(ValueError, match="bandwidth"):
+            KDEWeights(bad, device=DEVICE)
+    with pytest.raises(ValueError, match="chunk_size"):
+        KDEWeights(1.0, chunk_size=0, device=DEVICE)
+
+
+def test_kde_ranks_dense_regions_above_outliers():
+    from msde import KDEWeights
+
+    g = torch.Generator().manual_seed(1)
+    X = torch.cat([torch.randn(200, 2, generator=g) * 0.3, torch.tensor([[8.0, 8.0]])])
+    w = KDEWeights(bandwidth=0.5, device=DEVICE).compute(X)
+    assert w[-1] < w[:-1].min()
+
+
+@pytest.mark.parametrize("knn", ["euclidean", "cosine"])
+def test_kde_weights_in_model(knn):
+    from msde import CosineKNN, KDEWeights
+
+    X, y = make_data()
+    neighbors = CosineKNN(k=10, device=DEVICE) if knn == "cosine" else EuclideanKNN(k=10, device=DEVICE)
+    model = MeanShiftDensityEnhancement(
+        neighbors=neighbors, weights=KDEWeights("scott", device=DEVICE),
+        step=PlainBarycenter(device=DEVICE), loop=EarlyStopLoop(max_iters_shift=3), device=DEVICE,
+    )
+    shifted, dist, _ = model(X.clone(), labels=y)
+    assert shifted.shape == X.shape and torch.isfinite(shifted).all()
+    assert (shifted != X).any()
+
+
+def _anisotropic(n=300, d=5, seed=3):
+    g = torch.Generator().manual_seed(seed)
+    A = torch.randn(d, d, generator=g) * torch.tensor([6.0, 3.0, 1.0, 0.3, 0.05])    # very uneven spread
+    return torch.randn(n, d, generator=g) @ A
+
+
+def test_whitened_knn_matches_bruteforce_mahalanobis():
+    from msde import WhitenedKNN
+
+    X = _anisotropic()
+    Xd = X.double()
+    C = torch.cov(Xd.T)
+    P = torch.linalg.inv(C)
+    diff = Xd[:, None, :] - Xd[None, :, :]
+    maha = torch.einsum("ijd,de,ije->ij", diff, P, diff).clamp_min(0).sqrt()
+    expected = maha.topk(6, largest=False, dim=1)
+    nb = WhitenedKNN(k=6, regularization=0.0, device=DEVICE).select(X)
+    assert (nb.indices == expected.indices).float().mean() > 0.99
+    torch.testing.assert_close(nb.dist.double(), expected.values, atol=2e-2, rtol=2e-3)
+    assert (nb.dist[:, 0] == 0).all()
+
+
+def test_whitened_knn_is_invariant_to_invertible_linear_maps_unlike_euclidean():
+    from msde import WhitenedKNN
+
+    X = _anisotropic().double()                    # covariance eigenvalues span ~1e6
+    g = torch.Generator().manual_seed(9)
+    M = (torch.randn(5, 5, generator=g) + 3 * torch.eye(5)).double()
+    wk = WhitenedKNN(k=6, regularization=1e-9, device=DEVICE)   # ridge small enough not to bend the metric
+    a, b = wk.select(X).indices, wk.select(X @ M).indices
+    assert (a == b).float().mean() > 0.999
+    eu = EuclideanKNN(k=6, device=DEVICE)
+    assert (eu.select(X).indices == eu.select(X @ M).indices).float().mean() < 0.9   # Euclidean is not
+    assert (a != eu.select(X).indices).any()
+
+
+def test_whitened_knn_handles_rank_deficient_data_and_labels():
+    from msde import WhitenedKNN
+
+    g = torch.Generator().manual_seed(5)
+    X = torch.randn(20, 40, generator=g)                         # fewer points than features
+    X[:, 3] = 1.0                                                # constant column
+    y = (torch.arange(20) % 2).long()
+    nb = WhitenedKNN(k=4, device=DEVICE).select(X, labels=y, corpus_labels=y)
+    assert torch.isfinite(nb.dist[nb.valid]).all()
+    assert (nb.dist[:, 0] == 0).all() and nb.valid.all()
+    with pytest.raises(ValueError, match="regularization"):
+        WhitenedKNN(regularization=-1.0, device=DEVICE)
+
+
+def test_whitened_model_runs():
+    from msde import WhitenedKNN
+
+    X, y = make_data()
+    model = MeanShiftDensityEnhancement(
+        neighbors=WhitenedKNN(k=10, device=DEVICE), weights=SparseEmpirical(nbd_sample_count_threshold=10, device=DEVICE),
+        step=PlainBarycenter(device=DEVICE), loop=EarlyStopLoop(max_iters_shift=3), device=DEVICE,
+    )
+    shifted, _, _ = model(X.clone(), labels=y)
+    assert shifted.shape == X.shape and torch.isfinite(shifted).all() and (shifted != X).any()
