@@ -169,7 +169,7 @@ class SparseEmpirical(DensityWeights):
         self.register_scalar("eps", eps, device)
 
     @torch.no_grad()
-    def compute(self, X):
+    def compute(self, X, stability=None):
         return get_empirical_weights(
             X,
             nbd_sample_count_threshold=self.nbd_sample_count_threshold,

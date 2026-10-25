@@ -4,6 +4,23 @@ import torch
 
 logger = logging.getLogger("msde")
 
+
+def _raise_dynamo_recompile_limit(limit=128):
+    """Every compiled kernel built from the same factory shares one code object,
+    and dynamo counts recompiles per code object (default limit 8). Trying a
+    handful of k values, dtypes or shapes would otherwise hit the limit, which
+    is a hard error under ``fullgraph=True``."""
+    try:
+        import torch._dynamo.config as dynamo_config
+        for name in ("recompile_limit", "cache_size_limit"):
+            if hasattr(dynamo_config, name):
+                setattr(dynamo_config, name, max(getattr(dynamo_config, name), limit))
+    except Exception:       # a torch build without dynamo: nothing to raise
+        pass
+
+
+_raise_dynamo_recompile_limit()
+
 DEFAULT_DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 
 

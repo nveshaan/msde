@@ -49,7 +49,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         return self.label_policy.mode
 
     @torch.no_grad()
-    def forward(self, X, gate=1.0, labels=None):
+    def forward(self, X, gate=1.0, labels=None, stability=None):
         """
         Run MSDE and return ``(shifted, total_distance, trajectory)``.
 
@@ -59,7 +59,23 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             gets fewer effective neighbours; a point with *no* valid neighbours
             is left unmoved rather than shifted towards a meaningless
             barycenter.
+        stability : optional (n,) per-point stability scores in [0, 1] (higher =
+            more stable), read by weights strategies with ``uses_stability``
+            (``GravityWeights``). Passing it to any other weights strategy is
+            an error rather than being silently ignored.
         """
+        if stability is not None:
+            if not self.weights.uses_stability:
+                raise ValueError(
+                    f"stability was given, but {type(self.weights).__name__} does not use it; "
+                    f"use a weights strategy with uses_stability (e.g. GravityWeights)"
+                )
+            stability = torch.as_tensor(stability, device=X.device, dtype=X.dtype)
+            if stability.dim() != 1 or stability.shape[0] != X.shape[0]:
+                raise ValueError(f"stability must be 1D with length n={X.shape[0]}; got shape {tuple(stability.shape)}")
+            if not (torch.isfinite(stability).all() and (stability >= 0).all() and (stability <= 1).all()):
+                raise ValueError("stability scores must be finite and within [0, 1]")
+
         query_labels = corpus_labels = None
         if labels is not None:
             corpus_labels = as_label_tensor(labels, X.shape[0], self.device_name)
@@ -68,7 +84,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         ctx = LoopContext(
             neighbors=self.neighbors,
             step=self.step,
-            base_weights=self.weights.compute(X),
+            base_weights=self.weights.compute(X, stability=stability),
             query_labels=query_labels,
             corpus_labels=corpus_labels,
             gate=gate,

@@ -63,6 +63,7 @@ def torch_knn(X, k, device=DEFAULT_DEVICE, chunk_size=8192, labels=None, corpus_
     ("euclidean" or "cosine" distance)."""
     if metric not in METRICS:
         raise ValueError(f"metric must be one of {sorted(METRICS)}; got {metric!r}")
+    X = X.detach()      # an autograd flag would be a separate compiled specialisation
     X_full = X
 
     if isinstance(k, bool) or not isinstance(k, int):

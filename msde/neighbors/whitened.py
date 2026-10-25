@@ -31,8 +31,8 @@ class WhitenedKNN(ChunkedKNN):
 
     metric = "euclidean"
 
-    def __init__(self, k=30, regularization=1e-6, device=DEFAULT_DEVICE, chunk_size=4096):
-        super().__init__(k=k, device=device, chunk_size=chunk_size)
+    def __init__(self, k=30, regularization=1e-6, device=DEFAULT_DEVICE, chunk_size=4096, exclude_self=False):
+        super().__init__(k=k, device=device, chunk_size=chunk_size, exclude_self=exclude_self)
         if not regularization >= 0:
             raise ValueError(f"regularization must be >= 0; got {regularization!r}")
         self.regularization = regularization

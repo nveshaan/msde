@@ -27,11 +27,13 @@ class Neighbors:
 class NeighborSelector(ScalarModule):
     """Chooses, for every point, which other points it is pulled towards."""
 
-    def select(self, X, labels=None, corpus_labels=None):
+    def select(self, X, labels=None, corpus_labels=None, base_weights=None):
         """Return ``Neighbors`` for the rows of ``X`` among the rows of ``X``.
 
         ``labels`` are the query-side labels (already mapped by the label
         policy) and ``corpus_labels`` the neighbour-side labels; when
         ``labels`` is given, a point may only reach points with a matching label.
+        ``base_weights`` is the (n,) per-point attraction factor from the weights
+        component; distance-only selectors ignore it.
         """
         raise NotImplementedError

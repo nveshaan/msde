@@ -15,9 +15,9 @@ uv sync
 ```
 msde/
   module.py        MeanShiftDensityEnhancement: composes the four components
-  neighbors/       NeighborSelector -> EuclideanKNN, CosineKNN, WhitenedKNN
-  weights/         DensityWeights   -> SparseEmpirical, KDEWeights
-  step/            MovementStep     -> PlainBarycenter
+  neighbors/       NeighborSelector -> EuclideanKNN, CosineKNN, WhitenedKNN, JointKNN
+  weights/         DensityWeights   -> SparseEmpirical, KDEWeights, GravityWeights, UniformWeights
+  step/            MovementStep     -> PlainBarycenter, GravityBarycenter
   loop/            ShiftLoop        -> EarlyStopLoop
   common/          code shared by more than one component
 tests/             regression tests against the pre-refactor outputs

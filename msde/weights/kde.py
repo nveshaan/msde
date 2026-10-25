@@ -61,7 +61,7 @@ class KDEWeights(DensityWeights):
         return max(scale * factor, 1e-12)
 
     @torch.no_grad()
-    def compute(self, X):
+    def compute(self, X, stability=None):
         n = X.shape[0]
         inv_two_h2 = 1.0 / (2.0 * self.resolve_bandwidth(X) ** 2)
         weights = torch.empty(n, dtype=X.dtype, device=X.device)

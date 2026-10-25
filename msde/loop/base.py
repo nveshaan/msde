@@ -83,6 +83,7 @@ class ShiftLoop(ScalarModule):
                     shifted,
                     labels=ctx.query_labels if masked else None,
                     corpus_labels=ctx.corpus_labels if masked else None,
+                    base_weights=ctx.base_weights,
                 )
                 state = ctx.step.prepare(shifted, ctx.base_weights, neighbors)
                 orphan_mask = neighbors.orphan_mask
