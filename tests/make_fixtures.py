@@ -12,12 +12,8 @@ CASES = {
     "plain": dict(kwargs=dict(k=10, nbd_sample_count_threshold=10, max_iters_shift=4), labels=False),
     "same_label": dict(kwargs=dict(k=10, nbd_sample_count_threshold=10, max_iters_shift=4), labels=True),
     "zero_label": dict(kwargs=dict(k=10, nbd_sample_count_threshold=10, max_iters_shift=4, label_mode="zero_label"), labels=True),
-    "reference": dict(kwargs=dict(k=10, nbd_sample_count_threshold=10, max_iters_shift=4), labels=False, ref=True),
     "clip": dict(kwargs=dict(k=10, nbd_sample_count_threshold=10, max_iters_shift=4, clipping=True, clip_mode=2), labels=False),
     "recompute": dict(kwargs=dict(k=10, nbd_sample_count_threshold=10, max_iters_shift=4, recompute_neighbors=2), labels=False),
-    "soft_topk": dict(kwargs=dict(k=10, nbd_sample_count_threshold=10, max_iters_shift=4, use_soft_topk=True, soft_topk_temperature=0.5, temperature=0.5), labels=False),
-    "full_diff": dict(kwargs=dict(k=10, nbd_sample_count_threshold=10, max_iters_shift=3, fully_differentiable=True, temperature=0.3), labels=False),
-    "full_diff_labels": dict(kwargs=dict(k=10, nbd_sample_count_threshold=10, max_iters_shift=3, fully_differentiable=True, temperature=0.3), labels=True),
 }
 
 

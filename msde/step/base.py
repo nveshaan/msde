@@ -1,7 +1,7 @@
-from ..common.utils import ParametrizedModule
+from ..common.utils import ScalarModule
 
 
-class MovementStep(ParametrizedModule):
+class MovementStep(ScalarModule):
     """Moves points towards a weighted barycenter of their neighbours.
 
     A step is split in two phases so the loop can reuse expensive work between
@@ -13,12 +13,10 @@ class MovementStep(ParametrizedModule):
     step -- called every iteration with that ``state``.
     """
 
-    accepts = None  # the Neighbors form this step consumes: "hard" or "soft"
-
-    def prepare(self, X, corpus, base_weights, neighbors):
+    def prepare(self, X, base_weights, neighbors):
         """Return the opaque state used by the following ``step`` calls."""
         raise NotImplementedError
 
-    def step(self, X, corpus, state, gate=1.0):
+    def step(self, X, state, gate=1.0):
         """Return ``(X_new, change)``; ``change`` is the per-point movement (n,)."""
         raise NotImplementedError

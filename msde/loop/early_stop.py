@@ -3,9 +3,8 @@ from .base import ShiftLoop
 
 class EarlyStopLoop(ShiftLoop):
     """Iterate up to ``max_iters_shift`` times, stopping once the mean movement
-    drops below ``shift_threshold`` (a data-dependent ``.item()`` branch, so not
-    meant for end-to-end differentiable graphs). Neighbours are computed once
-    unless ``recompute_neighbors`` is a positive N."""
+    drops below ``shift_threshold``. Neighbours are computed once unless
+    ``recompute_neighbors`` is a positive N."""
 
     def __init__(self, max_iters_shift=5, shift_threshold=0.0001, recompute_neighbors=0,
                  keep_trajectory=False):

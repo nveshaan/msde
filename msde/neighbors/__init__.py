@@ -1,5 +1,6 @@
 from .base import NeighborSelector, Neighbors
-from .hard import HardKNN
-from .soft import SoftKNN
+from .chunked import ChunkedKNN
+from .cosine import CosineKNN
+from .euclidean import EuclideanKNN
 
-__all__ = ["NeighborSelector", "Neighbors", "HardKNN", "SoftKNN"]
+__all__ = ["NeighborSelector", "Neighbors", "ChunkedKNN", "EuclideanKNN", "CosineKNN"]

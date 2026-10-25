@@ -17,7 +17,7 @@ class LabelPolicy:
         self.mode = mode
 
     def query_labels(self, labels):
-        """Labels the query side compares against the corpus labels."""
+        """Labels the query side compares against the neighbour-side labels."""
         if self.mode == "same_label":
             return labels
         return torch.zeros_like(labels)

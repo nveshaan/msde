@@ -1,6 +1,6 @@
 # Mean-Shift Density Enhancement
 
-Extending MSDE for end-to-end learning.
+MSDE built from four swappable components.
 
 ## Setup
 
@@ -15,10 +15,10 @@ uv sync
 ```
 msde/
   module.py        MeanShiftDensityEnhancement: composes the four components
-  neighbors/       NeighborSelector -> HardKNN, SoftKNN
-  weights/         DensityWeights   -> SparseEmpirical, SoftEmpirical
-  step/            MovementStep     -> PlainBarycenter, SoftBarycenter
-  loop/            ShiftLoop        -> EarlyStopLoop, FixedLoop
+  neighbors/       NeighborSelector -> EuclideanKNN, CosineKNN
+  weights/         DensityWeights   -> SparseEmpirical
+  step/            MovementStep     -> PlainBarycenter
+  loop/            ShiftLoop        -> EarlyStopLoop
   common/          code shared by more than one component
 tests/             regression tests against the pre-refactor outputs
 ```

@@ -19,16 +19,15 @@ def _build_sparse_weight_matrix(indices_i64, w_norm, n_rows, n_cols, device):
 _MOVEMENT_GATE_EPS = 1e-8
 
 
-def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_precision_dtype=torch.bfloat16,
-                           smooth_movement_gate=False):
+def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_precision_dtype=torch.bfloat16):
     """Build the compiled dense movement kernel."""
 
-    def _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate, corpus):
+    def _kernel(X, indices, w_or_barycenter, learning_rate, alpha, gate):
         n, k = indices.shape
         neighbor_pos = None
 
         if needs_gather:
-            neighbor_pos = corpus[indices]
+            neighbor_pos = X[indices]
             if low_precision:
                 lp_w = w_or_barycenter.to(low_precision_dtype)
                 lp_neighbors = neighbor_pos.to(low_precision_dtype)
@@ -43,7 +42,7 @@ def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_
 
         if clipping and clip_mode > 0:
             if neighbor_pos is None:
-                neighbor_pos = corpus[indices]
+                neighbor_pos = X[indices]
             dists = torch.cdist(X.unsqueeze(1), neighbor_pos).squeeze(1)
             median_dist = dists.sort(dim=1).values[:, k // 2]
             delta = (alpha * median_dist).clamp_min(1e-8)
@@ -58,37 +57,30 @@ def _make_movement_kernel(clipping, clip_mode, needs_gather, low_precision, low_
         scale = (learning_rate * effective_step / dist_move_safe).unsqueeze(-1)
         step = gate * scale * diff
 
-        if smooth_movement_gate:
-            movement_gate = dist_move / (dist_move + _MOVEMENT_GATE_EPS)
-            revised_d = X + movement_gate.unsqueeze(-1) * step
-            change = movement_gate * dist_move
-        else:
-            moved = dist_move >= _MOVEMENT_GATE_EPS
-            updated = X + step
-            revised_d = torch.where(moved.unsqueeze(-1), updated, X)
-            change = torch.where(moved, dist_move, torch.zeros_like(dist_move))
+        moved = dist_move >= _MOVEMENT_GATE_EPS
+        updated = X + step
+        revised_d = torch.where(moved.unsqueeze(-1), updated, X)
+        change = torch.where(moved, dist_move, torch.zeros_like(dist_move))
 
         return revised_d, change
 
     return torch.compile(_kernel, fullgraph=True)
 
 
-def _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision, low_precision_dtype=torch.bfloat16,
-                        smooth_movement_gate=False):
+def _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision, low_precision_dtype=torch.bfloat16):
     """Build one cached shift step for a fixed configuration."""
     movement_kernel = _make_movement_kernel(
         clipping, clip_mode, needs_gather=not use_sparse,
         low_precision=low_precision, low_precision_dtype=low_precision_dtype,
-        smooth_movement_gate=smooth_movement_gate,
     )
 
     if use_sparse:
-        def _shift(X, indices, w_or_W, learning_rate, alpha, gate, corpus):
-            barycenter = torch.sparse.mm(w_or_W, corpus)
-            return movement_kernel(X, indices, barycenter, learning_rate, alpha, gate, corpus)
+        def _shift(X, indices, w_or_W, learning_rate, alpha, gate):
+            barycenter = torch.sparse.mm(w_or_W, X)
+            return movement_kernel(X, indices, barycenter, learning_rate, alpha, gate)
     else:
-        def _shift(X, indices, w_or_W, learning_rate, alpha, gate, corpus):
-            return movement_kernel(X, indices, w_or_W, learning_rate, alpha, gate, corpus)
+        def _shift(X, indices, w_or_W, learning_rate, alpha, gate):
+            return movement_kernel(X, indices, w_or_W, learning_rate, alpha, gate)
 
     return _shift
 
@@ -96,29 +88,25 @@ def _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision, low_preci
 _SHIFT_KERNEL_CACHE = {}
 
 
-def _get_shift_kernel(clipping, clip_mode, use_sparse, low_precision, smooth_movement_gate=False):
-    key = (clipping, clip_mode, use_sparse, low_precision, smooth_movement_gate)
+def _get_shift_kernel(clipping, clip_mode, use_sparse, low_precision):
+    key = (clipping, clip_mode, use_sparse, low_precision)
     if key not in _SHIFT_KERNEL_CACHE:
-        _SHIFT_KERNEL_CACHE[key] = _make_shift_kernel(
-            clipping, clip_mode, use_sparse, low_precision, smooth_movement_gate=smooth_movement_gate,
-        )
+        _SHIFT_KERNEL_CACHE[key] = _make_shift_kernel(clipping, clip_mode, use_sparse, low_precision)
     return _SHIFT_KERNEL_CACHE[key]
 
 
 class PlainBarycenter(MovementStep):
-    """Hard-neighbour barycenter step (selected neighbours only).
+    """Barycenter step over the selected neighbours.
 
-    Weights are the density prior of each selected neighbour, optionally times
-    the selector's soft membership and the label-validity mask, normalised per
-    row. use_sparse_shift computes the barycenter with a sparse matmul
-    (no per-iteration (n, k, d) gather) when the device supports it.
+    Weights are the density prior of each selected neighbour, times the
+    label-validity mask, normalised per row. ``use_sparse_shift`` computes the
+    barycenter with a sparse matmul (no per-iteration (n, k, d) gather) when the
+    device supports it.
 
     clipping / clip_mode : 0 = off, 1 = soft-saturating step, 2 = hard cap at
-        alpha times the median neighbour distance.
-    smooth_movement_gate : replace the hard "did it move" gate by a smooth one.
+        ``alpha`` times the median neighbour distance.
+    low_precision_barycenter : gather-mode barycenter in bfloat16.
     """
-
-    accepts = "hard"
 
     def __init__(
         self,
@@ -126,38 +114,28 @@ class PlainBarycenter(MovementStep):
         alpha=0.5,
         clipping=False,
         clip_mode=0,
-        learn_learning_rate=False,
-        learn_alpha=False,
         use_sparse_shift=True,
         low_precision_barycenter=False,
-        smooth_movement_gate=False,
         device=DEFAULT_DEVICE,
     ):
         super().__init__()
         self.clipping = clipping
         self.clip_mode = clip_mode
         self.device_name = device
-        self.smooth_movement_gate = smooth_movement_gate
         # Resolved once per instance: sparse-spmm barycenter vs dense gather.
         self.use_sparse_shift = use_sparse_shift and sparse_mm_supported(device)
         self.low_precision_barycenter = low_precision_barycenter
 
-        dtype = next(
-            (v.dtype for v in (learning_rate, alpha) if isinstance(v, torch.Tensor) and v.is_floating_point()),
-            torch.get_default_dtype(),
-        )
-        self.register_scalar("learning_rate", learning_rate, learn_learning_rate, device, dtype)
-        self.register_scalar("alpha", alpha, learn_alpha, device, dtype)
+        self.register_scalar("learning_rate", learning_rate, device)
+        self.register_scalar("alpha", alpha, device)
         self._shift_kernel = _get_shift_kernel(
             clipping, clip_mode, self.use_sparse_shift, low_precision_barycenter,
-            smooth_movement_gate=smooth_movement_gate,
         )
 
-    def prepare(self, X, corpus, base_weights, neighbors):
+    @torch.no_grad()
+    def prepare(self, X, base_weights, neighbors):
         indices = neighbors.indices                                   # (n, k) int64
         w = base_weights[indices]                                     # (n, k)
-        if neighbors.weights is not None:
-            w = w * neighbors.weights
         if neighbors.valid is not None:
             w = w * neighbors.valid
 
@@ -166,14 +144,15 @@ class PlainBarycenter(MovementStep):
 
         if self.use_sparse_shift:
             w_or_W = _build_sparse_weight_matrix(
-                indices, w_norm, X.shape[0], corpus.shape[0], self.device_name
+                indices, w_norm, X.shape[0], X.shape[0], self.device_name
             )
         else:
             w_or_W = w_norm
         return indices.to(torch.int32), w_or_W
 
-    def step(self, X, corpus, state, gate=1.0):
+    @torch.no_grad()
+    def step(self, X, state, gate=1.0):
         indices, w_or_W = state
         return self._shift_kernel(
-            X, indices, w_or_W, self.learning_rate, self.alpha, gate, corpus,
+            X, indices, w_or_W, self.learning_rate, self.alpha, gate,
         )

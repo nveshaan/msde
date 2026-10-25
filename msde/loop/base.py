@@ -4,29 +4,26 @@ from typing import Optional
 
 import torch
 
-from ..common.utils import ParametrizedModule, logger
+from ..common.utils import ScalarModule, logger
 
 
 @dataclass
 class LoopContext:
     """Everything a loop needs besides the points being shifted.
 
-    ``reference`` is the fixed corpus in reference-shift mode (None in
-    self-shift mode, where the corpus is the points themselves). Labels are
-    None when no masking applies: ``query_labels`` are already mapped by the
-    label policy, ``corpus_labels`` are the corpus side's.
+    Labels are None when no masking applies: ``query_labels`` are already
+    mapped by the label policy, ``corpus_labels`` are the neighbour side's.
     """
 
     neighbors: torch.nn.Module
     step: torch.nn.Module
     base_weights: torch.Tensor
-    reference: Optional[torch.Tensor] = None
     query_labels: Optional[torch.Tensor] = None
     corpus_labels: Optional[torch.Tensor] = None
     gate: float = 1.0
 
 
-class ShiftLoop(ParametrizedModule):
+class ShiftLoop(ScalarModule):
     """Drives the neighbours -> step iteration.
 
     ``run`` is the shared skeleton; strategies override the policy hooks
@@ -67,10 +64,10 @@ class ShiftLoop(ParametrizedModule):
         """Transform ``(shifted, total_distance, trajectory)`` (default: identity)."""
         return result
 
+    @torch.no_grad()
     def run(self, X, ctx):
         """Return ``(shifted_dataset, total_distance, trajectory)``."""
         X = self.preprocess(X, ctx)
-        reference = ctx.reference
         masked = ctx.query_labels is not None
 
         shifted = X.clone()
@@ -81,19 +78,16 @@ class ShiftLoop(ParametrizedModule):
         orphan_mask = None    # (n,) bool -- points with zero valid neighbours at the last recompute
 
         for iter_count in range(self.max_iters_shift):
-            corpus = reference if reference is not None else shifted
-
             if self.should_recompute(iter_count):
                 neighbors = ctx.neighbors.select(
-                    shifted, corpus,
+                    shifted,
                     labels=ctx.query_labels if masked else None,
                     corpus_labels=ctx.corpus_labels if masked else None,
-                    exclude_self=reference is None,
                 )
-                state = ctx.step.prepare(shifted, corpus, ctx.base_weights, neighbors)
+                state = ctx.step.prepare(shifted, ctx.base_weights, neighbors)
                 orphan_mask = neighbors.orphan_mask
 
-            revised, change = ctx.step.step(shifted, corpus, state, ctx.gate)
+            revised, change = ctx.step.step(shifted, state, ctx.gate)
 
             if orphan_mask is not None and orphan_mask.any():
                 revised = torch.where(orphan_mask.unsqueeze(1), shifted, revised)
