@@ -20,10 +20,11 @@ msde/
   step/            MovementStep     -> PlainBarycenter, GravityBarycenter
   loop/            ShiftLoop        -> EarlyStopLoop
   common/          code shared by more than one component
-tests/             regression tests against the pre-refactor outputs
+  config.py        build a model from a YAML experiment config
+configs/           ready-made experiment configs (default, KDE + cosine, gravity ablation)
 ```
 
-See `DOC.md` for the API and how to add a new strategy. Run the tests with `uv run pytest`.
+See `DOC.md` for the API, experiment configs, and how to add a new strategy.
 
 ## Acknowledgements
 

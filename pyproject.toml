@@ -27,8 +27,3 @@ dependencies = [
     "tqdm>=4.67.3",
     "umap-learn>=0.5.12",
 ]
-
-[dependency-groups]
-dev = [
-    "pytest>=9.1.1",
-]

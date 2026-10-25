@@ -9,6 +9,9 @@ DENSITY_NORMALIZATIONS = ("none", "max", "minmax", "rank")
 class UniformWeights(DensityWeights):
     """Every point attracts equally (q_j = 1): the distance-only baseline."""
 
+    def __init__(self):
+        super().__init__()
+
     def compute(self, X, stability=None):
         return torch.ones(X.shape[0], dtype=X.dtype, device=X.device)
 

@@ -159,6 +159,48 @@ Decisions the spec left open:
 - **Neighbours are fixed** between recomputations while distances in the kernel follow the current positions; set `recompute_neighbors=1` on the loop to refresh the neighbour set every iteration.
 - **Normalise embeddings** after shifting yourself if the downstream model needs unit length, and consider `metric="cosine"` for unit-normalised embeddings.
 
+## Experiment configs
+
+A model can be described in a YAML file instead of code, which makes experiments easy to version, diff and sweep. The loader uses `omegaconf` (already a dependency).
+
+```python
+from msde.config import load_config, build_model, build_from_file
+
+model = build_from_file("configs/default.yaml", ["vars.k=10", "device=cpu"])
+shifted, movement, _ = model(X)
+```
+
+```yaml
+vars: {k: 20, h: auto}          # free-form values, referenced as ${vars.k}
+device: auto                    # auto | cpu | cuda | mps; passed to every component
+label_mode: same_label          # same_label | zero_label
+log_file: null
+neighbors: {name: JointKNN, k: "${vars.k}", h: "${vars.h}"}
+weights:                        # a component option that is itself a mapping with a
+  name: GravityWeights          # 'name' is built as a component (here: density)
+  density: {name: KDEWeights, bandwidth: scott}
+step: {name: GravityBarycenter, eta: 0.05, h: "${vars.h}"}
+loop: {name: EarlyStopLoop, max_iters_shift: 1}
+```
+
+- **Sections** are `neighbors`, `weights`, `step` and `loop`. Each is optional; an omitted one gets its default. `name` is a class from `msde`, or a dotted import path to your own strategy (`my_pkg.my_module.MyStep`); the other keys are that class's constructor options (see the tables above).
+- **Overrides** are `key=value` strings applied on top of the file, e.g. `["neighbors.k=10", "vars.eta=0.1", "weights.density.bandwidth=silverman"]`. This is the easy way to run a sweep: loop over override lists. Interpolated `vars` follow the override, so one `vars.h` can drive several components.
+- **Errors are specific**: an unknown top-level key, an unknown option name (with the valid ones listed), a component of the wrong kind in a section, an abstract base class, or a missing required nested component all raise a `ValueError` naming the offending path.
+- **Check a config** without writing code: `uv run python -m msde.config configs/default.yaml vars.k=10` prints the resolved config and the model it builds; `python -m msde.config --help` lists the available components.
+- The config describes the model only. Data, labels and `stability` scores are still passed to `forward`.
+
+Shipped configs, all in `configs/`:
+
+| File | What it is |
+| --- | --- |
+| `default.yaml` | The original behaviour, with every option and its alternatives listed |
+| `kde_cosine.yaml` | Gaussian-KDE density with cosine neighbours |
+| `ablation/1_distance_only.yaml` | Gravity study 1: distance-only selection and attraction |
+| `ablation/2_approach1.yaml` | Gravity study 2 (Approach 1): distance-only selection, density/stability-weighted attraction |
+| `ablation/3_approach2.yaml` | Gravity study 3 (Approach 2): joint selection and attraction |
+
+The three ablation files share their settings through `vars` and differ only in `neighbors` and `weights`, so a sweep over `vars.*` keeps the comparison controlled.
+
 ## Writing a new strategy
 
 Subclass the component's base class and override the documented methods; nothing else changes. A step that never moves points:
