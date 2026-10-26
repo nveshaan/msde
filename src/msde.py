@@ -26,10 +26,9 @@ Stability scores (values in [0, 1], higher = more stable) start at 1.0 for every
 the next neighbour weights and, whenever neighbours are reselected, the selection score. The selection score, the
 neighbour weights and the stability update can each be replaced by a callable (which carries its own parameters)
 passed to ``forward``; all three receive the index of the current iteration and the iteration cap, so they can
-change over the run, and the UMAP fuzzy graph that was built for the density. ``forward`` also creates three empty
-dicts before the first iteration, one memory each for the score, the weights and the stability; every one of the
-three callables receives all three and returns them (updated) with its result, so they can remember things across
-calls and share them.
+change over the run, and the UMAP fuzzy graph that was built for the density. ``forward`` also creates one empty
+dict before the first iteration; all three callables receive it and return it (updated) with their result, so they
+can remember things across calls and share them.
 
 Only torch is required.
 """
@@ -388,17 +387,15 @@ def _check_strength(name, value):
     return float(value)
 
 
-def _call_with_memory(fn, args, memories, name):
-    """``fn(*args, *memories)`` for a score/weight/stability callable; returns ``(output, memories)``.
+def _call_with_memory(fn, args, memory, name):
+    """``fn(*args, memory)`` for a score/weight/stability callable; returns ``(output, memory)``.
 
-    The callable gets the three memory dicts after its regular arguments and must return
-    ``(output, score_memory, weight_memory, stability_memory)``, the dicts being the updated memories."""
-    result = fn(*args, *memories)
-    if (not isinstance(result, tuple) or len(result) != 4
-            or not all(isinstance(memory, dict) for memory in result[1:])):
-        raise ValueError(f"{name} must return (output, score_memory, weight_memory, stability_memory) with the "
-                         "three memories as dicts")
-    return result[0], tuple(result[1:])
+    The callable gets the shared memory dict after its regular arguments and must return
+    ``(output, memory)``, the dict being the updated memory."""
+    result = fn(*args, memory)
+    if not isinstance(result, tuple) or len(result) != 2 or not isinstance(result[1], dict):
+        raise ValueError(f"{name} must return (output, memory) with the memory as a dict")
+    return result
 
 
 class NeighborScore:
@@ -410,11 +407,10 @@ class NeighborScore:
     ``h`` the kernel width.
 
     A replacement must have the same call signature and return a score of the same shape as ``dist``, together
-    with the memories: ``score(dist, density, stability, h, iteration, n_iters, graph, score_memory, weight_memory,
-    stability_memory) -> (score, score_memory, weight_memory, stability_memory)``. The three memories are dicts
-    that ``forward`` creates empty before the first iteration and hands to all three callables; return them
-    (updated or not) to keep what you stored. The score function is called once per block of rows, so the memories
-    pass through every block in turn. ``dist`` is a (chunk, n) block of
+    with the memory: ``score(dist, density, stability, h, iteration, n_iters, graph, memory) -> (score, memory)``.
+    The memory is one dict that ``forward`` creates empty before the first iteration and hands to all three
+    callables; return it (updated or not) to keep what you stored. The score function is called once per block of
+    rows, so the memory passes through every block in turn. ``dist`` is a (chunk, n) block of
     distances from a chunk of points to all points, ``density`` and ``stability`` the (n,) per-candidate vectors,
     ``h`` the kernel width in use, ``iteration`` the 0-based index of the current iteration, ``n_iters`` the
     iteration cap (``max_iters_shift``; the run may stop earlier by convergence) and ``graph`` the (chunk, n)
@@ -429,11 +425,9 @@ class NeighborScore:
         self.density_strength = _check_strength("density_strength", density_strength)
         self.stability_strength = _check_strength("stability_strength", stability_strength)
 
-    def __call__(self, dist, density, stability, h, iteration, n_iters, graph,
-                 score_memory, weight_memory, stability_memory):
+    def __call__(self, dist, density, stability, h, iteration, n_iters, graph, memory):
         kernel = torch.exp(-self.distance_strength * dist.square() / (2.0 * h * h))
-        score = density.pow(self.density_strength) * stability.pow(self.stability_strength) * kernel
-        return score, score_memory, weight_memory, stability_memory
+        return density.pow(self.density_strength) * stability.pow(self.stability_strength) * kernel, memory
 
 
 class NeighborWeight:
@@ -442,10 +436,9 @@ class NeighborWeight:
     The default neighbour weight (distance is ignored, so every selected neighbour counts according to how
     dense and stable it is). ``a`` and ``b`` are the density and stability strengths (>= 0).
 
-    A replacement must have the same call signature and also return the memories,
-    ``weight(dist, density, stability, h, iteration, n_iters, graph, score_memory, weight_memory,
-    stability_memory) -> (weights, score_memory, weight_memory, stability_memory)`` (the memories are the dicts
-    shared by the three callables, see ``NeighborScore``), with the tensors ``dist``, ``density``,
+    A replacement must have the same call signature and also return the memory,
+    ``weight(dist, density, stability, h, iteration, n_iters, graph, memory) -> (weights, memory)`` (the memory is
+    the dict shared by the three callables, see ``NeighborScore``), with the tensors ``dist``, ``density``,
     ``stability`` and ``graph`` of shape (n, k) for the k selected neighbours of every point (``dist`` the current
     distances to them in the selection space, ``stability`` their current scores, ``graph`` the weight of the UMAP
     fuzzy graph computed for the density between each point and each of its selected neighbours, 0 where the graph
@@ -459,15 +452,13 @@ class NeighborWeight:
         self.density_strength = _check_strength("density_strength", density_strength)
         self.stability_strength = _check_strength("stability_strength", stability_strength)
 
-    def __call__(self, dist, density, stability, h, iteration, n_iters, graph,
-                 score_memory, weight_memory, stability_memory):
-        weights = density.pow(self.density_strength) * stability.pow(self.stability_strength)
-        return weights, score_memory, weight_memory, stability_memory
+    def __call__(self, dist, density, stability, h, iteration, n_iters, graph, memory):
+        return density.pow(self.density_strength) * stability.pow(self.stability_strength), memory
 
 
 @torch.no_grad()
 def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False, whiten_regularization=1e-6,
-                     labels=None, corpus_labels=None, chunk_size=DEFAULT_CHUNK_SIZE, iteration=0, n_iters=1, memories=None):
+                     labels=None, corpus_labels=None, chunk_size=DEFAULT_CHUNK_SIZE, iteration=0, n_iters=1, memory=None):
     """The ``k`` best-scoring other points for every point of ``X``.
 
     Distances are Euclidean on ``X``, or, with ``whiten``, Euclidean in the whitened space of the current ``X``
@@ -476,20 +467,20 @@ def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False,
     the remaining slots (if any) go to the nearest candidates. With ``labels`` a point may only pick points
     whose ``corpus_labels`` equal its label.
 
-    ``iteration``, ``n_iters``, the rows of the fuzzy ``graph`` (see ``density_weights``) and the three
-    ``memories`` (score, weight, stability dicts; empty ones if omitted) are handed on to ``score_fn``, a chunk of
-    rows at a time, the memories passing through the chunks in turn.
+    ``iteration``, ``n_iters``, the rows of the fuzzy ``graph`` (see ``density_weights``) and the shared
+    ``memory`` dict (an empty one if omitted) are handed on to ``score_fn``, a chunk of rows at a time, the memory
+    passing through the chunks in turn.
 
     Returns ``(indices (n, k), dist (n, k), valid (n, k) bool or None, orphan (n,) bool or None, h, transform,
-    memories)``
+    memory)``
     where ``valid`` marks picks that respect the label mask, ``orphan`` marks points with no valid pick at all,
     ``dist`` the distances to the picks in the selection space, ``h`` the kernel width used (``"auto"`` resolves
     to the median distance to the ``k`` nearest neighbours in that space) and ``transform`` is ``None`` or, with
     ``whiten``, the ``(mean, W)`` that maps points into the selection space (see ``neighbor_distances``);
-    ``memories`` are the updated three dicts.
+    ``memory`` is the updated dict.
     """
     n = X.shape[0]
-    memories = ({}, {}, {}) if memories is None else tuple(memories)
+    memory = {} if memory is None else memory
     if isinstance(k, bool) or not isinstance(k, int) or not 1 <= k <= n - 1:
         raise ValueError(f"k={k!r} is invalid for {n} points; expected an integer 1 <= k <= {n - 1}")
     transform = None
@@ -510,9 +501,9 @@ def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False,
     for start in range(0, n, chunk_size):
         end = min(n, start + chunk_size)
         d = torch.cdist(Z[start:end], Z)                                     # (c, n) distances in the selection space
-        score, memories = _call_with_memory(
+        score, memory = _call_with_memory(
             score_fn, (d, density, stability, h, iteration, n_iters, _graph_rows(layout, start, end, n, X.dtype, X.device)),
-            memories, "the selection score function")
+            memory, "the selection score function")
         if score.shape != d.shape or not bool(torch.isfinite(score).all()):
             raise ValueError("the selection score must be finite and have the shape of the distance block "
                              f"{tuple(d.shape)}; got {tuple(score.shape)}")
@@ -530,8 +521,8 @@ def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False,
         valid[start:end] = torch.isfinite(top)
 
     if labels is None:
-        return indices, dist, None, None, h, transform, memories
-    return indices, dist, valid, ~valid.any(dim=1), h, transform, memories
+        return indices, dist, None, None, h, transform, memory
+    return indices, dist, valid, ~valid.any(dim=1), h, transform, memory
 
 
 @torch.no_grad()
@@ -551,17 +542,17 @@ def neighbor_distances(X, indices, transform=None, chunk_size=DEFAULT_CHUNK_SIZE
 # Weighted-mean step
 # ---------------------------------------------------------------------------------------------------------
 @torch.no_grad()
-def prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters, graph, memories):
+def prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters, graph, memory):
     """Normalised (n, k) neighbour weights, where the device supports it the sparse (n, n) weight matrix, and the
-    updated three ``memories`` dicts, as ``(indices, w, W, memories)``.
+    updated shared ``memory`` dict, as ``(indices, w, W, memory)``.
 
     ``weight_fn`` is evaluated here with the (n, k) tensors of the selected neighbours; ``graph`` is the (n, k)
     fuzzy-graph weights of the selected pairs (see ``graph_values_at``). The label-validity mask
     is applied and every row is normalised to sum to 1 (a row with no weight at all stays zero, which leaves its
     point in place once the step is renormalised onto the sphere).
     """
-    w, memories = _call_with_memory(
-        weight_fn, (dist, density[indices], stability[indices], h, iteration, n_iters, graph), memories,
+    w, memory = _call_with_memory(
+        weight_fn, (dist, density[indices], stability[indices], h, iteration, n_iters, graph), memory,
         "the neighbour weight function")
     if w.shape != indices.shape or not bool(torch.isfinite(w).all()) or bool((w < 0).any()):
         raise ValueError("the neighbour weights must be finite, non-negative and have shape "
@@ -578,7 +569,7 @@ def prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iter
             torch.stack([rows, indices.reshape(-1)]), w.reshape(-1), size=(n, n), device=w.device,
             check_invariants=False,
         ).coalesce()
-    return indices, w, W, memories
+    return indices, w, W, memory
 
 
 @torch.no_grad()
@@ -598,24 +589,23 @@ def weighted_mean(X, indices, w, W, chunk_size=DEFAULT_CHUNK_SIZE):
 # Stability update
 # ---------------------------------------------------------------------------------------------------------
 @torch.no_grad()
-def update_stability(stability_fn, step, density, stability, h, iteration, n_iters, graph, memories):
-    """New (n,) stability scores from the latest step vectors, and the updated three ``memories`` dicts, as
-    ``(scores, memories)``.
+def update_stability(stability_fn, step, density, stability, h, iteration, n_iters, graph, memory):
+    """New (n,) stability scores from the latest step vectors, and the updated shared ``memory`` dict, as
+    ``(scores, memory)``.
 
-    ``stability_fn(step, density, stability, h, iteration, n_iters, graph, score_memory, weight_memory,
-    stability_memory)`` returns ``(scores, score_memory, weight_memory, stability_memory)`` and gets the (n, d) displacement each point
+    ``stability_fn(step, density, stability, h, iteration, n_iters, graph, memory)`` returns ``(scores, memory)`` and gets the (n, d) displacement each point
     made in the iteration that just finished, the (n,) density, the (n,) scores before this update, the kernel
     width ``h``, the 0-based index of that iteration, the iteration cap and the full (n, n) sparse UMAP fuzzy
     graph computed for the density, and must return finite (n,) scores within [0, 1].
     """
-    new, memories = _call_with_memory(
-        stability_fn, (step, density, stability, h, iteration, n_iters, graph), memories, "the stability function")
+    new, memory = _call_with_memory(
+        stability_fn, (step, density, stability, h, iteration, n_iters, graph), memory, "the stability function")
     if not isinstance(new, torch.Tensor) or new.shape != stability.shape:
         raise ValueError(f"the stability scores must be a tensor of shape {tuple(stability.shape)}; "
                          f"got {tuple(getattr(new, 'shape', ()))}")
     if not (bool(torch.isfinite(new).all()) and bool((new >= 0).all()) and bool((new <= 1).all())):
         raise ValueError("stability scores must be finite and within [0, 1]")
-    return new.to(device=stability.device, dtype=stability.dtype), memories
+    return new.to(device=stability.device, dtype=stability.dtype), memory
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -751,23 +741,21 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             with no valid neighbour is left where it is.
         stability_fn : optional callable that updates the stability scores (higher = more stable, in [0, 1]) after
             every iteration; it carries its own parameters. Called as
-            ``stability_fn(step, density, stability, h, iteration, n_iters, graph, score_memory, weight_memory,
-            stability_memory)`` with ``step`` the (n, d) displacement
+            ``stability_fn(step, density, stability, h, iteration, n_iters, graph, memory)`` with ``step`` the (n, d) displacement
             every point made in the iteration that just finished (new unit position minus old; zero for a point
             left in place), ``density`` the (n,) density, ``stability`` the (n,) scores before this update (all 1.0
             at the start), ``h`` the kernel width in use, ``iteration`` the 0-based index of that iteration and
             ``n_iters`` the iteration cap (``max_iters_shift``) and ``graph`` the full (n, n) sparse UMAP fuzzy graph
-            computed for the density; it returns ``(scores, score_memory, weight_memory, stability_memory)``, the
+            computed for the density; it returns ``(scores, memory)``, the
             scores being (n,), finite and within [0, 1]. The first selection and the first step always use scores of 1.0 (there is no step yet). The
             updated scores are used by the next iteration's neighbour weights and by every later neighbour
             selection. Without a ``stability_fn`` the scores stay at 1.0. The final scores are available as
             ``stability_`` afterwards.
 
-        All three callables receive three dicts after their regular arguments, ``score_memory``, ``weight_memory``
-        and ``stability_memory``, and return them (updated) after their result, as
-        ``(result, score_memory, weight_memory, stability_memory)``. ``forward`` creates the dicts empty before the
-        first iteration, so a new call starts with no memory; every callable sees all three and may read and write
-        any of them. The dicts as they are after the run are available as ``memory_``.
+        All three callables receive one dict, ``memory``, after their regular arguments and return it (updated)
+        after their result, as ``(result, memory)``. ``forward`` creates it empty before the first iteration, so a
+        new call starts with no memory; every callable reads and writes the same dict. It is available as
+        ``memory_`` after the run.
         score_fn : optional replacement for the selection score (see ``NeighborScore``; it carries its own
             parameters and receives ``iteration`` and ``n_iters``). It is used for every neighbour selection,
             including the initial one: with ``recompute_neighbors=0`` it defines the single neighbour graph the
@@ -789,7 +777,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                              f"for n={n} points")
 
         stability = torch.ones(n, dtype=X.dtype, device=X.device)           # every point starts fully stable
-        memories = ({}, {}, {})                                              # score, weight, stability memory: empty at the start
+        memory = {}                                                          # shared by the three callables: empty at the start
         query_labels, neighbor_labels = self._labels(labels, n)
         score_fn = score_fn if score_fn is not None else self.default_score
         weights_every_iteration = weight_fn is not None or stability_fn is not None
@@ -810,18 +798,18 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         for iteration in range(n_iters):
             selected = iteration == 0 or bool(self.recompute_neighbors and iteration % self.recompute_neighbors == 0)
             if selected:
-                indices, dist, valid, orphan, h, transform, memories = select_neighbors(
+                indices, dist, valid, orphan, h, transform, memory = select_neighbors(
                     x, density, stability, self.k, self.h, score_fn, graph,
                     whiten=self.whiten_selection, whiten_regularization=self.whiten_regularization,
                     labels=query_labels, corpus_labels=neighbor_labels, chunk_size=self.chunk_size,
-                    iteration=iteration, n_iters=n_iters, memories=memories,
+                    iteration=iteration, n_iters=n_iters, memory=memory,
                 )
                 graph_pairs = graph_values_at(graph, indices).to(x.dtype)     # fuzzy-graph weight of every selected pair
             elif weights_every_iteration:
                 dist = neighbor_distances(x, indices, transform, self.chunk_size)   # distances at the current positions
             if selected or weights_every_iteration:
-                state = prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters, graph_pairs, memories)
-                memories = state[3]
+                state = prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters, graph_pairs, memory)
+                memory = state[3]
 
             mean = weighted_mean(x, *state[:3], chunk_size=self.chunk_size)
             moved = unit(x + self.learning_rate * gate * (mean - x))         # step, then back onto the sphere
@@ -837,13 +825,13 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             mean_change = change.mean().item()
             logger.debug("iteration %d: mean movement %.6f", iteration + 1, mean_change)
             if stability_fn is not None:
-                stability, memories = update_stability(stability_fn, step, density, stability, h, iteration, n_iters, graph, memories)
+                stability, memory = update_stability(stability_fn, step, density, stability, h, iteration, n_iters, graph, memory)
             if mean_change < self.shift_threshold:
                 logger.info("converged after %d iterations", iteration + 1)
                 break
 
         self.stability_ = stability                                          # the final scores (1.0 without a stability_fn)
-        self.memory_ = dict(zip(("score", "weight", "stability"), memories))      # the three memory dicts after the run
+        self.memory_ = memory                                                # the shared memory after the run
         return x, total_distance, trajectory
 
 
