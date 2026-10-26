@@ -223,10 +223,11 @@ def _fuzzy_graph(knn_indices, knn_dists, n, k, n_epochs):
     return rows[active], cols[active], w_sym[active]
 
 
-def _similarity_graph(X, n_neighbors, n_epochs):
-    """The fuzzy neighbour graph of ``X`` as a coalesced sparse (n, n) matrix."""
+def _similarity_graph(X, n_neighbors, n_epochs, chunk_size=8192):
+    """The fuzzy neighbour graph of ``X`` as a coalesced sparse (n, n) matrix. The exact neighbour search that
+    feeds it works ``chunk_size`` rows at a time; everything after it is ``O(n * n_neighbors)``."""
     n = X.shape[0]
-    knn_idx, knn_dist = knn(X, n_neighbors)
+    knn_idx, knn_dist = knn(X, n_neighbors, chunk_size=chunk_size)
     rows, cols, vals = _fuzzy_graph(knn_idx, knn_dist, n, n_neighbors, n_epochs)
     return torch.sparse_coo_tensor(
         torch.stack([rows, cols]), vals, size=(n, n), device=X.device, check_invariants=False,
@@ -319,7 +320,8 @@ def density_weights(X, nbd_sample_count_threshold=30, n_neighbors=15, n_epochs=2
 
     A fuzzy ``n_neighbors``-nearest-neighbour graph of ``X`` (the UMAP fuzzy simplicial set: per-point scale,
     fuzzy-union symmetrised weights in (0, 1], weak edges dropped) is built and its rows are compared as sparse
-    vectors (sparse matmul, ``chunk_size`` rows at a time). With ``return_graph`` the result is
+    vectors (sparse matmul). ``chunk_size`` is the number of rows handled at a time, both by the exact neighbour
+    search that builds the graph and by those graph-space distances; it bounds the memory of the whole computation. With ``return_graph`` the result is
     ``(density, graph)`` where ``graph`` is that (n, n) coalesced sparse tensor. The radius is the smallest one at which at least
     ``satisfiability_proportion`` of the points have more than ``nbd_sample_count_threshold`` others inside
     it (found by bisection, relaxed once if that fails). The density of a point is its number of others
@@ -328,7 +330,7 @@ def density_weights(X, nbd_sample_count_threshold=30, n_neighbors=15, n_epochs=2
     if whiten:
         X = whiten_points(X, whiten_regularization)
     n = X.shape[0]
-    S = _similarity_graph(X, n_neighbors, n_epochs)
+    S = _similarity_graph(X, n_neighbors, n_epochs, chunk_size)
     layout = _graph_layout(S)
 
     max_dist, min_dist = _graph_distance_range(S, layout, chunk_size)

@@ -40,7 +40,7 @@ shifted, movement, trajectory = model(X)
 | `n_epochs` | 200 | Density: edges weaker than `max / n_epochs` are dropped from the graph. |
 | `max_iters_weight_count` | 4 | Density: number of shrinking radii averaged. |
 | `satisfiability_proportion` | 0.3 | Density: fraction of points that must satisfy the threshold. |
-| `weight_chunk_size` | 2048 | Density: rows of graph-space distances held at once. |
+| `weight_chunk_size` | 2048 | Density: rows handled at a time, both by the neighbour search that builds the fuzzy graph and by the graph-space distances. Lower it if memory runs out. It changes results only through floating-point rounding in the distances: in tests, 500 rows or more gave results identical to an unchunked run, while a very small value (64) shifted a few densities by about 0.1% and the final output by up to 0.015. |
 | `learning_rate` | 0.3 | Fraction of the way a point moves towards its weighted mean per iteration. |
 | `distance_strength` | 1.0 | Strength `c` of the distance term of the default selection score. |
 | `density_strength` | 1.0 | Strength `a` of the density term, in the default selection score and neighbour weight. |
