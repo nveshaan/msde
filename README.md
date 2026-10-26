@@ -1,6 +1,6 @@
 # Mean-Shift Density Enhancement
 
-MSDE built from four swappable components.
+Mean-shift density enhancement of unit-normalised embeddings, in a single file: `src/msde.py`.
 
 ## Setup
 
@@ -10,21 +10,14 @@ cd msde
 uv sync
 ```
 
-## Layout
+```python
+from msde import MeanShiftDensityEnhancement
 
-```
-msde/
-  module.py        MeanShiftDensityEnhancement: composes the four components
-  neighbors/       NeighborSelector -> EuclideanKNN, CosineKNN, WhitenedKNN, JointKNN
-  weights/         DensityWeights   -> SparseEmpirical, KDEWeights, GravityWeights, UniformWeights
-  step/            MovementStep     -> PlainBarycenter, GravityBarycenter
-  loop/            ShiftLoop        -> EarlyStopLoop, NormalizedLoop
-  common/          code shared by more than one component
-  config.py        build a model from a YAML experiment config
-configs/           ready-made experiment configs (default, KDE + cosine, gravity ablation)
+shifted, movement, trajectory = MeanShiftDensityEnhancement(k=50)(X)
 ```
 
-See `DOC.md` for the API, experiment configs, and how to add a new strategy.
+See `DOC.md` for the pipeline, every option, how to replace the selection score and the neighbour weights, and speed notes.
+A modular version, with swappable neighbour, weight, step and loop components and YAML experiment configs, lives on the `modular` branch.
 
 ## Acknowledgements
 

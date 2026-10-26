@@ -1,259 +1,144 @@
 # MSDE
 
-MSDE (mean-shift density enhancement) computes an empirical density weight for each point, selects neighbours, and repeatedly moves each point toward a weighted neighbour barycenter.
-
-It is built from **four swappable components**, each with a base class and one or more strategies. Everything runs under `torch.no_grad()`; nothing is differentiable.
-
-| Component | Base class | Question it answers | Strategies |
-| --- | --- | --- | --- |
-| `msde.neighbors` | `NeighborSelector` | Which points is each point pulled towards? | `EuclideanKNN`, `CosineKNN`, `WhitenedKNN`, `JointKNN` |
-| `msde.weights` | `DensityWeights` | How typical/dense is each point? | `SparseEmpirical`, `KDEWeights`, `GravityWeights`, `UniformWeights` |
-| `msde.step` | `MovementStep` | How does a point move towards the weighted barycenter? | `PlainBarycenter`, `GravityBarycenter` |
-| `msde.loop` | `ShiftLoop` | How is the iteration run (schedule, stopping, pre/post-processing)? | `EarlyStopLoop` |
-
-Code shared by more than one component lives in `msde.common` (`knn`, `graph`, `eps`, `labels`, `utils`). Components never import from each other.
+Mean-shift density enhancement (MSDE) of embeddings, in one file: [`src/msde.py`](src/msde.py). Every point is repeatedly moved towards a weighted mean of its neighbours until the movement converges, and the embeddings stay on the unit sphere throughout. Only `torch` is required.
 
 ```python
 import torch
-from msde import (
-    MeanShiftDensityEnhancement, EuclideanKNN, SparseEmpirical, PlainBarycenter, EarlyStopLoop,
-)
+from msde import MeanShiftDensityEnhancement
 
-X = torch.randn(10_000, 128, device="cuda")
+X = torch.randn(3000, 512)                      # any (n, d) float embeddings; they are normalised internally
 
-model = MeanShiftDensityEnhancement(
-    neighbors=EuclideanKNN(k=30, device="cuda"),
-    weights=SparseEmpirical(nbd_sample_count_threshold=30, use_chunking=True, chunk_size=2048, device="cuda"),
-    step=PlainBarycenter(learning_rate=0.3, device="cuda"),
-    loop=EarlyStopLoop(max_iters_shift=5),
-    device="cuda",
-)
+model = MeanShiftDensityEnhancement(k=50, learning_rate=0.33, device="mps")   # "cpu" / "cuda" / "mps"
 shifted, movement, trajectory = model(X)
 ```
 
-Every component is optional; omitted ones default to the combination above. `shifted` has shape `(n, d)`, `movement` has shape `(n,)` (accumulated movement), and `trajectory` is empty unless the loop has `keep_trajectory=True`.
+`shifted` is the `(n, d)` unit-norm result, `movement` the `(n,)` distance each point travelled (summed chord lengths on the sphere), and `trajectory` a list of unit-norm states (only if `keep_trajectory=True`). Everything runs under `torch.no_grad()`: nothing is differentiable.
 
-## Notation and cost model
+## Pipeline
 
-- `n`: points; `d`: feature dimension; `k`: shift neighbours; `q`: `SparseEmpirical.n_neighbors` (default 15); `c`: chunk size; `I_s`: shift iterations; `r`: neighbour rebuilds (`r=1` for `recompute_neighbors=0`, else `<= ceil(I_s/p)`).
-- `EuclideanKNN` / `CosineKNN` / `WhitenedKNN`: `O(n^2*d)` time even when chunked; `O(c*n + n*k)` working space. `WhitenedKNN` adds `O(n*d^2 + d^3)` for the covariance and its eigendecomposition.
-- `SparseEmpirical`: the k-NN stage is `O(n^2*d)`; the fuzzy graph has `E ~ 2*n*q` edges. Each graph row is an `n`-dimensional sparse vector, so one chunked radius-count pass costs `O(E*n) = O(n^2*q)` time (a sparse-times-dense matmul per chunk) with `O(c*n)` working space. The pipeline runs about 20 such passes: one min/max pass, a bisection for epsilon (`~log2(range/1e-4)`, at most 50, plus a relaxed retry when it fails) and `max_iters_weight_count` weight passes. Total `O(n^2*(d + P*q))` with `P ~ 20`. The dense variant materialises `S` and calls `cdist` on `n`-dimensional rows: `O(n^3)` time and `O(n^2)` memory.
-- `JointKNN`: `O(n^2*d)` time (every point is a candidate) and `O(c*n)` working space; with `h="auto"` it adds one k-NN pass to estimate the bandwidth.
-- `KDEWeights`: `O(n^2*d)` time and `O(c*n)` working space, i.e. one pairwise-distance pass. This is the cost of `SparseEmpirical`'s k-NN stage alone, without its `O(P*n^2*q)` graph-space counting.
-- `PlainBarycenter`: sparse mode ~`O(n^2*d)`; gather mode `O(n*k*d)`; clipping adds `O(n*k*d)`.
-- `torch.compile` is used for dense kernels; the first call for a new shape/configuration includes compilation, so do not benchmark it.
+`forward` runs these stages in order.
 
-## Components
+1. **Normalise** the input to unit length. Points are re-normalised immediately after every shift, so every state the loop passes through, every trajectory entry and the output are unit-norm. (A zero vector has no direction: it is pulled along by its neighbours and is unit-norm after the first shift.)
+2. **Whiten** the points: centre them and rescale by the inverse square root of their covariance, so that Euclidean distance between whitened points is the Mahalanobis distance. Correlated or unevenly scaled directions then stop dominating. The covariance is accumulated and decomposed in float64 on the CPU (forming it in float32 squares the condition number and loses the small eigenvalues of typical embeddings), with a ridge `whiten_regularization * mean(eigenvalue)` added to the eigenvalues; the result is cast back to the input dtype before it is moved to the device (some devices have no float64).
+3. **Density** of every point, computed **once** on the whitened initial points:
+   - build an exact `n_neighbors`-nearest-neighbour graph and turn it into a sparse fuzzy graph (per-point scale found by bisection, symmetrised by fuzzy union, weak edges dropped);
+   - compare points as rows of that sparse graph: distances come from one sparse-times-dense matmul `S @ chunk.T` per chunk of rows;
+   - find the smallest radius at which at least `satisfiability_proportion` of the points have more than `nbd_sample_count_threshold` others inside it (bisection, relaxed once if it fails);
+   - a point's density is its number of other points within the radius, averaged over `max_iters_weight_count` radii shrinking linearly to zero.
+4. **Select neighbours.** In the whitened space of the current points, every other point is scored by `NeighborScore` and the `k` best are kept: with the default score `density^a * stability^b * exp(-c * d^2 / (2 h^2))`, so a dense, stable point can outrank a closer, sparse one. All points are candidates (no distance pre-filter) and a point is never its own neighbour. Candidates with a positive score rank by score; if fewer than `k` have one, the remaining slots go to the nearest candidates.
+5. **Weights.** Each selected neighbour gets a weight from `NeighborWeight` (default `density^a * stability^b`), evaluated at selection time; weights of picks that violate the label mask are zeroed and rows are normalised to sum to 1.
+6. **Step.** `mean = W @ X` with `W` a sparse `(n, n)` matrix holding the `n*k` normalised weights (one sparse matmul), then `x' = normalise(x + learning_rate * gate * (mean - x))`.
+7. **Repeat** until the mean per-point movement on the sphere falls below `shift_threshold` (convergence) or `max_iters_shift` iterations have run. With `recompute_neighbors = N > 0`, stages 2, 4 and 5 are redone every `N` iterations on the current points (iterations 0, N, 2N, ...); the density is never recomputed.
 
-### Neighbours (`msde.neighbors`)
+## Constructor
 
-`select(X, labels, corpus_labels, base_weights) -> Neighbors` (`base_weights` is the weights component's per-point output; distance-only selectors ignore it), where `Neighbors` is a dataclass with `indices (n,k)`, `dist (n,k)`, and, when labels are given, `valid (n,k)` and `orphan_mask (n,)`.
-
-| Strategy | Options |
-| --- | --- |
-| `EuclideanKNN` | `k` (must satisfy `1 <= k <= n`, validated before the compiled `topk`), `chunk_size`, `device`, `exclude_self` (default `False`: a point is its own first neighbour at distance 0; `True`: it is never its own neighbour, and exactly `k` others are returned). Ranks by Euclidean distance. Every k-NN strategy in this list except `JointKNN` takes the same options. |
-| `CosineKNN` | Same options. Ranks by cosine distance `1 - cos(x, y)` (in `[0, 2]`), so it ignores each point's scale; `Neighbors.dist` holds cosine distances. Only the neighbour choice changes: density weights and the movement step still work in the original feature space. |
-| `WhitenedKNN` | `k`, `chunk_size`, `device`, `regularization` (ridge on the covariance eigenvalues, relative to their mean; default `1e-6`). Centres and whitens the points with their covariance, then searches by Euclidean distance, i.e. ranks by Mahalanobis distance; `Neighbors.dist` holds Mahalanobis distances. The ranking is invariant to invertible linear maps of the features. The covariance is estimated from all points on every `select` call (so it follows the shifting points), regardless of labels. The ridge keeps degenerate directions (fewer points than features, constant columns) from being amplified, but it is not basis-invariant: lower it (e.g. `1e-9`) for very ill-conditioned data. The `d x d` eigendecomposition runs on the CPU in float64. |
-| `JointKNN` | `k`, `h` (kernel bandwidth: a positive number, or `"auto"` = median distance to the `k` nearest neighbours, re-estimated on each call), `metric` (`"euclidean"` or `"cosine"`), `chunk_size`, `device`. Selects `TopK_{j != i} q_j * exp(-d_ij^2 / 2h^2)`, where `q_j` is the weights component's output, so a dense, stable point can outrank a closer unstable one. Never returns the point itself. Zero scores: positive scores rank first and any remaining slots go to the nearest candidates. See [Gravity-based enhancement](#gravity-based-enhancement). |
-
-All three share `ChunkedKNN` (`msde.neighbors.chunked`): a subclass sets a `metric` key from `msde.common.knn.METRICS` and may override `transform(X)` to search in a transformed space (`WhitenedKNN` does).
-
-### Weights (`msde.weights`)
-
-`compute(X, stability=None) -> (n,)`. `stability` is the optional per-point score passed to `forward(..., stability=s)`; only strategies with `uses_stability = True` read it, and `forward` raises if it is given to any other.
-
-| Strategy | Options |
-| --- | --- |
-| `SparseEmpirical` | `nbd_sample_count_threshold`, `n_neighbors` (15), `n_epochs` (200), `max_iters_weight_count` (4), `satisfiability_proportion` (0.3), `use_chunking` / `chunk_size`, `eps` (fixed radius; otherwise found by bisection), `device` |
-| `KDEWeights` | `bandwidth` (a positive number, or `"scott"` (default) / `"silverman"` computed from the data on each call), `chunk_size`, `device`. Gaussian KDE with leave-one-out: `weight_i = sum_{j != i} exp(-\|x_i - x_j\|^2 / 2h^2)`, an unnormalised soft neighbour count in `[0, n-1]`, on the same scale as `SparseEmpirical`'s counts. In high dimensions the rules give `h` close to the per-feature spread, so the estimate is very smooth; pass a number to sharpen it. |
-| `GravityWeights` | `density` (any `DensityWeights` strategy giving `rho`, e.g. `KDEWeights`), `alpha`, `beta`, `density_normalization` (`"none"`, `"max"` (default), `"minmax"`, `"rank"`), `density_floor` (default `1e-6`), `stability_floor` (default `0`). Returns `q_j = rho_j^alpha * s_j^beta` with `s` from `forward(..., stability=s)`; without scores `s = 1`. |
-| `UniformWeights` | none. Returns 1 for every point (`q_j = 1`), the distance-only baseline. |
-
-### Step (`msde.step`)
-
-Two phases so the loop can reuse work between neighbour recomputations: `prepare(X, base_weights, neighbors) -> state` (on every recompute) and `step(X, state, gate) -> (X_new, change)` (every iteration).
-
-| Strategy | Options |
-| --- | --- |
-| `PlainBarycenter` | `learning_rate`, `alpha`, `clipping`, `clip_mode` (0 off, 1 saturating, 2 hard cap at `alpha` x median neighbour distance), `use_sparse_shift` (sparse matmul vs gather), `low_precision_barycenter`, `device` |
-| `GravityBarycenter` | `eta` (step size, `0 < eta <= 1`; `gate` scales it per call), `h` (positive number or `"auto"`), `metric` (`"euclidean"` / `"cosine"`), `eps`, `chunk_size`, `device`. Computes `w_ij = q_j * exp(-d_ij^2 / 2h^2)`, `mu_i = sum_j w_ij x_j / (sum_j w_ij + eps)` and `x_i' = x_i + eta * (mu_i - x_i)`. A point whose weights sum to at most `eps` stays where it is. Distances are recomputed from the current positions each iteration, from a snapshot. |
-
-### Loop (`msde.loop`)
-
-`ShiftLoop.run` is the shared skeleton: iterate (`before_shift`, recompute neighbours / `prepare` on schedule, `step`, `after_shift`, orphan freeze, trajectory) -> `postprocess`. Strategies override the policy hooks `should_recompute` and `converged`, and the transform hooks, which all default to identity:
-
-- `preprocess(X)`: once, *before the weights are computed*, so the weights see the preprocessed points;
-- `before_shift(X, iter_count, ctx)`: at the start of every iteration, before neighbours are selected;
-- `after_shift(X, X_new, change, ctx)`: after every step;
-- `postprocess((shifted, total_distance, trajectory), ctx)`: once, at the end.
-
-| Strategy | Options |
-| --- | --- |
-| `EarlyStopLoop` | `max_iters_shift`, `shift_threshold` (stop when mean movement is below it), `recompute_neighbors` (`0`/`None`: once; positive `p`: at iterations 0, p, 2p, ...), `keep_trajectory` |
-| `NormalizedLoop` | Everything `EarlyStopLoop` takes, plus `tangent_projection=False`, `normalize_output=False`, `eps=1e-12`. Runs on the unit sphere: normalises the input (so the density weights are computed on the sphere too) and again before every shift. `tangent_projection` removes the radial component of each shift; `normalize_output` also returns unit vectors (otherwise points end just inside the sphere after the last shift). A zero vector stays zero. |
-
-## `MeanShiftDensityEnhancement` options
-
-`neighbors`, `weights`, `step`, `loop` (components), plus:
-
-| Option | Effect |
-| --- | --- |
-| `labels` (per call) | Integer labels passed to `forward(X, gate=1.0, labels=None)`. |
-| `label_mode` | `"same_label"` (default) or `"zero_label"`; see [Label masking](#label-masking). |
-| `gate` (per call) | Multiplier on the shift step for that call. |
-| `stability` (per call) | Optional `(n,)` scores in `[0, 1]` (higher = more stable), used by `GravityWeights`. |
-| `log_file` | Logging is silent when `None`; with a path, this package's messages are written there and propagation to root handlers is disabled. |
-
-## Label masking
-
-Labels passed to `forward(X, labels=y)` restrict which points can be neighbours:
-
-| `label_mode` | Point with label 0 | Point with label 1, 2, 3, ... |
+| Argument | Default | Meaning |
 | --- | --- | --- |
-| `"same_label"` (default) | label-0 neighbours | neighbours with its own label |
-| `"zero_label"` | label-0 neighbours | label-0 neighbours |
+| `k` | 50 | Neighbours each point is pulled towards; needs `k <= n - 1`. |
+| `nbd_sample_count_threshold` | 30 | Density: how many others must lie within the radius for a point to "satisfy" it. |
+| `n_neighbors` | 15 | Density: neighbours of the fuzzy graph (`<= n`). |
+| `n_epochs` | 200 | Density: edges weaker than `max / n_epochs` are dropped from the graph. |
+| `max_iters_weight_count` | 4 | Density: number of shrinking radii averaged. |
+| `satisfiability_proportion` | 0.3 | Density: fraction of points that must satisfy the threshold. |
+| `weight_chunk_size` | 2048 | Density: rows of graph-space distances held at once. |
+| `learning_rate` | 0.3 | Fraction of the way a point moves towards its weighted mean per iteration. |
+| `distance_strength` | 1.0 | Strength `c` of the distance term of the default selection score. |
+| `density_strength` | 1.0 | Strength `a` of the density term, in the default selection score and neighbour weight. |
+| `stability_strength` | 1.0 | Strength `b` of the stability term, in the default selection score and neighbour weight. |
+| `h` | `"auto"` | Kernel width of the distance term, in whitened units: a positive number, or `"auto"` = median distance to the `k` nearest neighbours, re-estimated at every selection. |
+| `whiten_regularization` | 1e-6 | Relative ridge of the whitening. |
+| `recompute_neighbors` | 0 | 0 / `None`: select neighbours once; `N > 0`: reselect every `N` iterations. |
+| `max_iters_shift` | 100 | Safety cap on iterations; the loop normally stops earlier by convergence. |
+| `shift_threshold` | 1e-4 | Convergence: stop when the mean per-point movement is below this. |
+| `keep_trajectory` | `False` | Also return the unit-norm state after every iteration. |
+| `label_mode` | `"same_label"` | How `labels` restrict neighbours: `"same_label"` (neighbours share the point's label) or `"zero_label"` (neighbours must have label 0, whatever the point's own label). |
+| `chunk_size` | 1024 | Rows of the `n x n` distance blocks held at once during selection. |
+| `device` | auto | `"mps"`, `"cuda"` or `"cpu"`; inputs are moved there. |
 
-```python
-model = MeanShiftDensityEnhancement(label_mode="zero_label")
-shifted, movement, _ = model(X, labels=y)   # every point shifts towards label-0 points
-```
+A strength is a number `>= 0`; 0 switches that factor off and larger values weight it more (they are exponents on density and stability, and a multiplier on the squared distance in the kernel).
 
-- The k-NN strategies set cross-class distances to `inf` before `topk`. With fewer than `k` eligible points the extras get zero weight; with none, the point is an orphan and the loop leaves it unmoved.
-- `k` is validated against the total number of points, not the number eligible under the mask.
-- Density weights are not masked; only neighbour eligibility depends on labels.
-- `zero_label` needs label-0 points in `X`; otherwise every point is an orphan and nothing moves.
+## `forward(X, gate=1.0, labels=None, stability=None, score_fn=None, weight_fn=None)`
 
-## Gravity-based enhancement
-
-Shift points towards stable, dense local regions. With density `rho_i`, stability `s_i` in `[0, 1]`, and `K(d) = exp(-d^2 / 2h^2)`, the attraction factor is `q_j = rho_j^alpha * s_j^beta`. Selection and attraction weighting are separate components, so the study's three configurations differ in exactly one component:
-
-```python
-from msde import (MeanShiftDensityEnhancement as MSDE, EuclideanKNN, JointKNN, KDEWeights,
-                  GravityWeights, UniformWeights, GravityBarycenter, EarlyStopLoop)
-
-density = lambda: KDEWeights("scott")
-step = lambda: GravityBarycenter(eta=0.05, h="auto")
-loop = lambda: EarlyStopLoop(max_iters_shift=1)       # start with one iteration
-
-# 1. distance-only selection and attraction
-m1 = MSDE(neighbors=EuclideanKNN(k=20, exclude_self=True), weights=UniformWeights(), step=step(), loop=loop())
-# 2. Approach 1: distance-only selection, density/stability-weighted attraction
-m2 = MSDE(neighbors=EuclideanKNN(k=20, exclude_self=True), weights=GravityWeights(density()), step=step(), loop=loop())
-# 3. Approach 2: joint selection and attraction
-m3 = MSDE(neighbors=JointKNN(k=20, h="auto"), weights=GravityWeights(density()), step=step(), loop=loop())
-
-shifted, movement, _ = m3(X, stability=s)             # s: (n,) in [0, 1]
-```
-
-| Spec | Component |
+| Argument | Meaning |
 | --- | --- |
-| `k`, distance metric | `k` and `metric` of the neighbours component (`GravityBarycenter`/`JointKNN` take `metric` for the kernel distance) |
-| `alpha`, `beta`, density / stability preprocessing | `GravityWeights` (`alpha`, `beta`, `density_normalization`, `density_floor`, `stability_floor`) |
-| `h` | `JointKNN.h` and `GravityBarycenter.h`; set both to the same number, or leave both `"auto"` (same estimate) |
-| `eta`, `eps` | `GravityBarycenter` |
-| Number of iterations, recomputing neighbours | the loop's `max_iters_shift` and `recompute_neighbors` |
-| `rho` | any density strategy passed as `GravityWeights(density=...)` |
+| `X` | `(n, d)` floating-point embeddings. |
+| `gate` | Multiplier on the step size for this call (0 leaves the points where they are). |
+| `labels` | `(n,)` integer labels restricting neighbour selection (see `label_mode`). A point with no valid neighbour is left where it is. |
+| `stability` | `(n,)` scores in `[0, 1]`, higher = more stable. Default: 1.0 for every point. Fixed for the whole run; never updated by it. |
+| `score_fn` | Replacement for the selection score. Used for **every** neighbour selection, including the initial one, so with `recompute_neighbors=0` it defines the single neighbour graph the run uses. |
+| `weight_fn` | Replacement for the neighbour weights of the weighted mean. Optional; the default is used when it is not given. |
 
-Decisions the spec left open:
+### Replacing the selection score and the neighbour weights
 
-- **Self-neighbours** are excluded (`exclude_self=True` on the k-NN strategies; `JointKNN` always).
-- **Zero attraction:** with `stability_floor=0`, zero stability removes a point's attraction completely. A small positive floor keeps it faintly attractive. `rho` is floored at `density_floor` so any `alpha` is valid.
-- **Zero weight sum:** a point whose weights sum to at most `eps` is not moved. The literal formula would pull it towards the origin.
-- **`JointKNN` zero scores:** positive scores rank first; remaining slots (or all of them, if every score is zero) go to the nearest remaining candidates.
-- **`JointKNN` locality:** all points are candidates, with no distance pre-filter, so selection is global in principle and local only through `h`.
-- **Stability is a destination property:** it sets how strongly a point attracts others, never how much it resists moving.
-- **Neighbours are fixed** between recomputations while distances in the kernel follow the current positions; set `recompute_neighbors=1` on the loop to refresh the neighbour set every iteration.
-- **Normalise embeddings** after shifting yourself if the downstream model needs unit length, and consider `metric="cosine"` for unit-normalised embeddings.
-
-## Working on the unit sphere
-
-`NormalizedLoop` normalises the points before every shift. Two questions come up, measured on unit vectors (k = 30, Linux CPU and Apple MPS):
-
-**Euclidean or cosine neighbours?** The same neighbours, at the same speed, so choose Euclidean.
-- For unit vectors `||x - y||^2 = 2 - 2 cos(x, y)` is monotone in the cosine, so `EuclideanKNN` and `CosineKNN` returned identical neighbour sets in every run (n up to 32,000, d = 64 and 512).
-- The search itself is a distance matrix plus top-k, and the metric changes neither: the times matched within noise (cosine / Euclidean = 0.96-1.16 on CPU, 0.99-1.00 on MPS).
-- The metric inside `GravityBarycenter` does matter: the Euclidean kernel was 1.6-1.9x faster than the cosine one on CPU and about 1.5x on MPS. On the sphere the two distances carry the same information, so use `metric="euclidean"` there too. The kernel bandwidth `h` is on a different scale for the two (cosine distance is half the squared Euclidean distance), so `h` does not carry over.
-- `CosineKNN` is still the right choice when the vectors are *not* normalised and you want scale-free neighbours.
-
-**Does projecting the shift onto the tangent matter?** A little, in a predictable way.
-- A step `x' = x + eta (mu - x)` toward a mean `mu` of unit vectors has a radial component `mu . x - 1 <= 0`, so it cuts inside the sphere (mean radial component -0.044 in one step on random data; points ended at norm 0.85-1.0). With `tangent_projection=True` the shift is orthogonal to `x` and the point stays on the sphere to first order (it ends slightly outside, at norm up to ~1.02).
-- Because the next iteration renormalises, the inward part is thrown away anyway. What is left is a difference in step *size*: the projected step keeps weight `1 - eta (mu . x)` on `x` where the plain step keeps `1 - eta`, so it moves a bit less. The gap grows with the angular spread of the neighbourhood and vanishes for tight ones.
-- Measured (n = 2000, d = 16, four clusters, 5 iterations, plain barycenter with lr 0.3): the first step is 5% shorter in angle for k = 5 (neighbourhood angle 33 deg), 8% for k = 80 (42 deg) and 11% for k = 320 (50 deg). After 5 iterations the two results differ by 0.7-1.0 deg on average, and the projected run is slightly less contracted: mean angle to the cluster centre 26.2 vs 26.0 deg at k = 5, and 11.9 vs 10.9 deg at k = 320. The gravity step behaves the same.
-- So with renormalisation the projection is nearly equivalent to using a slightly smaller step size, and a plain `eta` / learning rate can absorb it. It is more than cosmetic if you do *not* renormalise between shifts (the radial loss then compounds and points collapse toward the origin), or if you want to read the reported movement as a pure angular distance: with `tangent_projection=True` the reported movement is scaled by the fraction of the shift that was kept, so the early-stopping threshold stays comparable.
-
-## Experiment configs
-
-A model can be described in a YAML file instead of code, which makes experiments easy to version, diff and sweep. The loader uses `omegaconf` (already a dependency).
+Both are plain callables that carry their own parameters; the defaults are the callable classes `NeighborScore(distance_strength, density_strength, stability_strength)` and `NeighborWeight(density_strength, stability_strength)`.
 
 ```python
-from msde.config import load_config, build_model, build_from_file
+score_fn(dist, density, stability, h) -> score        # dist: (chunk, n) distances from a chunk of points to all points
+                                                      # density, stability: (n,) per candidate; h: kernel width in use
+                                                      # score: (chunk, n), finite; larger = more attractive;
+                                                      # <= 0 means "no attraction" (only used to fill remaining slots)
 
-model = build_from_file("configs/default.yaml", ["vars.k=10", "device=cpu"])
-shifted, movement, _ = model(X)
+weight_fn(dist, density, stability, h) -> weights     # all (n, k): the k selected neighbours of every point
+                                                      # (dist = whitened distances at selection time)
+                                                      # weights: (n, k), finite and >= 0; normalised per row afterwards
 ```
 
-```yaml
-vars: {k: 20, h: auto}          # free-form values, referenced as ${vars.k}
-device: auto                    # auto | cpu | cuda | mps; passed to every component
-label_mode: same_label          # same_label | zero_label
-log_file: null
-neighbors: {name: JointKNN, k: "${vars.k}", h: "${vars.h}"}
-weights:                        # a component option that is itself a mapping with a
-  name: GravityWeights          # 'name' is built as a component (here: density)
-  density: {name: KDEWeights, bandwidth: scott}
-step: {name: GravityBarycenter, eta: 0.05, h: "${vars.h}"}
-loop: {name: EarlyStopLoop, max_iters_shift: 1}
-```
-
-- **Sections** are `neighbors`, `weights`, `step` and `loop`. Each is optional; an omitted one gets its default. `name` is a class from `msde`, or a dotted import path to your own strategy (`my_pkg.my_module.MyStep`); the other keys are that class's constructor options (see the tables above).
-- **Overrides** are `key=value` strings applied on top of the file, e.g. `["neighbors.k=10", "vars.eta=0.1", "weights.density.bandwidth=silverman"]`. This is the easy way to run a sweep: loop over override lists. Interpolated `vars` follow the override, so one `vars.h` can drive several components.
-- **Errors are specific**: an unknown top-level key, an unknown option name (with the valid ones listed), a component of the wrong kind in a section, an abstract base class, or a missing required nested component all raise a `ValueError` naming the offending path.
-- **Check a config** without writing code: `uv run python -m msde.config configs/default.yaml vars.k=10` prints the resolved config and the model it builds; `python -m msde.config --help` lists the available components.
-- The config describes the model only. Data, labels and `stability` scores are still passed to `forward`.
-
-Shipped configs, all in `configs/`:
-
-| File | What it is |
-| --- | --- |
-| `default.yaml` | The original behaviour, with every option and its alternatives listed |
-| `kde_cosine.yaml` | Gaussian-KDE density with cosine neighbours |
-| `normalized.yaml` | MSDE on the unit sphere with `NormalizedLoop` |
-| `ablation/1_distance_only.yaml` | Gravity study 1: distance-only selection and attraction |
-| `ablation/2_approach1.yaml` | Gravity study 2 (Approach 1): distance-only selection, density/stability-weighted attraction |
-| `ablation/3_approach2.yaml` | Gravity study 3 (Approach 2): joint selection and attraction |
-
-The three ablation files share their settings through `vars` and differ only in `neighbors` and `weights`, so a sweep over `vars.*` keeps the comparison controlled.
-
-## Writing a new strategy
-
-Subclass the component's base class and override the documented methods; nothing else changes. A step that never moves points:
+Distances are whitened-space distances. Shape or value violations raise `ValueError`. Examples:
 
 ```python
-from msde import MovementStep
+from msde import MeanShiftDensityEnhancement, NeighborScore, NeighborWeight
+import torch
 
-class Frozen(MovementStep):
-    def prepare(self, X, base_weights, neighbors):
-        return None                       # opaque state reused by step()
+model = MeanShiftDensityEnhancement(k=30, recompute_neighbors=1)
 
-    def step(self, X, state, gate=1.0):
-        return X, torch.zeros(X.shape[0], dtype=X.dtype, device=X.device)
+# stronger emphasis on stability, weaker on distance, chosen per call
+shifted, _, _ = model(X, stability=s, score_fn=NeighborScore(distance_strength=0.5, density_strength=1, stability_strength=2))
+
+# a custom score with its own parameter: ignore distance beyond a cutoff
+def cutoff_score(dist, density, stability, h, cutoff=3.0):
+    return density * stability * (dist < cutoff * h)
+
+# distance-aware neighbour weights (attraction decays with distance); refreshed whenever neighbours are reselected
+def gravity_weight(dist, density, stability, h):
+    return density * stability * torch.exp(-dist.square() / (2 * h * h))
+shifted, _, _ = model(X, weight_fn=gravity_weight)
 ```
 
-Use `self.register_scalar(name, value, device)` (from `ScalarModule`, the shared base) to store a scalar hyperparameter as a buffer. Loop pre/post-processing:
+`weight_fn` is evaluated at each neighbour selection, with the distances of that moment. With `recompute_neighbors=0` that is once, at the start; to let distance-dependent weights follow the moving points, enable `recompute_neighbors`.
 
-```python
-class Doubling(EarlyStopLoop):
-    def postprocess(self, result, ctx):
-        shifted, dist, trajectory = result
-        return shifted * 2, dist, trajectory
-```
+## Speed
 
-## Standalone functions
+The two heavy matrix products are sparse matmuls, kept on purpose:
 
-For profiling or custom pipelines: `msde.common.knn` (`torch_knn`, `compute_fixed_knn`), `msde.common.graph` (`fuzzy_simplicial_set_torch`), `msde.common.eps` (`radius_counts_chunked`, `calculate_eps_from_similarity`), and `msde.weights.sparse` (`get_empirical_weights`, `compute_weights_from_similarity_chunked`, `compute_weights_from_similarity_dense`).
+- the density's radius counting (`S @ chunk.T`, about 20 passes), which dominates the density cost;
+- the weighted mean `W @ X` of every iteration.
 
-## Failure modes and checks
+If a device cannot do sparse matmul (probed once per device), the weighted mean falls back to a chunked gather. Measured for one weighted-mean step with `k = 50`:
 
-- The k-NN strategies validate `1 <= k <= n` before calling `torch.topk`; in a masked run `n` is still the total number of points.
-- Label tensors must be integer-like, 1-D and aligned with the points.
-- Benchmark after the first call per shape: compiled kernels compile lazily.
+| device | `n` | `d` | sparse `W @ X` | gather | gather / sparse |
+| --- | --- | --- | --- | --- | --- |
+| CPU | 3,240 | 512 | 34 ms | 235 ms | 7.0x |
+| CPU | 3,240 | 1152 | 88 ms | 528 ms | 6.0x |
+| CPU | 16,000 | 512 | 362 ms | 1164 ms | 3.2x |
+| Apple MPS | 3,240 | 512 | 2.7 ms | 45 ms | 17x |
+| Apple MPS | 3,240 | 1152 | 3.0 ms | 101 ms | 34x |
+| Apple MPS | 16,000 | 512 | 11 ms | 222 ms | 20x |
+
+Cost model (`n` points of dimension `d`; `P` about 20 counting passes, `q` = `n_neighbors`):
+
+- whitening: `O(n d^2 + d^3)` in float64 on the CPU, at the start and at every neighbour reselection;
+- density: `O(n^2 d)` for the k-NN graph plus `O(P n^2 q)` for the counting passes, once;
+- selection: `O(n^2 d)` time and `O(chunk_size * n)` working memory per selection (plus one extra k-NN pass when `h="auto"`);
+- each iteration: one sparse matmul, `O(n k d)`.
+
+On an Apple MPS device a run on 3,240 points with `d` between 512 and 1152 takes about 0.5-0.7 s to converge (18-20 iterations). `torch.compile` is used for the k-NN, graph and distance kernels, so the first call for a new shape includes compilation time.
+
+## Things to know
+
+- **The movement can be informative in either direction.** If you use `movement` as an anomaly score, its AUROC can be well below 0.5 (anomalies move *less*) for some encoders and above 0.5 for others; judge it by `max(auroc, 1 - auroc)` and fix the direction per encoder.
+- **Density is computed once**, from the whitened initial points, and is not refreshed by `recompute_neighbors`.
+- **Whitening needs `n` comfortably above `d`.** With fewer points than dimensions the covariance is singular and the ridge decides the scale of the null directions; the result is finite but noisy. Embeddings with a very wide eigenvalue spread (1e8 and beyond) are handled in float64, but the smallest directions are still governed by `whiten_regularization`.
+- **`h` is in whitened units.** A numeric `h` is therefore not comparable with raw embedding distances; `"auto"` adapts to the data.
+- **Stability is an input, not an output.** The run never changes it. To use a computed stability (for example from a first MSDE pass), pass it in `stability=`.
+- **A point whose weights are all zero stays put** after the step, up to float rounding (its mean is the zero vector, so the step scales it by `1 - learning_rate` and re-normalisation restores its direction).
+- **Small differences across devices.** CPU and MPS agree to about `1e-4` on the converged output; the movement AUROC differed by 0.003 in one run (iterated float32 arithmetic).
