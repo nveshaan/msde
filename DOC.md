@@ -50,7 +50,7 @@ shifted, movement, trajectory = model(X)
 | `whiten_selection` | `False` | Select neighbours by distances in whitened space, re-estimated from the current points at every selection. |
 | `whiten_regularization` | 1e-6 | Relative ridge of the whitening; only used when one of the two flags is set (see [The ridge](#the-ridge)). |
 | `recompute_neighbors` | 0 | 0 / `None`: select neighbours once; `N > 0`: reselect every `N` iterations. |
-| `max_iters_shift` | 100 | Safety cap on iterations; the loop normally stops earlier by convergence. |
+| `max_iters_shift` | 1000 | Safety cap on iterations; the loop normally stops earlier by convergence (see [Speed](#speed) for typical counts). |
 | `shift_threshold` | 1e-4 | Convergence: stop when the mean per-point movement is below this. |
 | `keep_trajectory` | `False` | Also return the unit-norm state after every iteration. |
 | `label_mode` | `"same_label"` | How `labels` restrict neighbours: `"same_label"` (neighbours share the point's label) or `"zero_label"` (neighbours must have label 0, whatever the point's own label). |
@@ -147,7 +147,7 @@ Cost model (`n` points of dimension `d`; `P` about 20 counting passes, `q` = `n_
 - selection: `O(n^2 d)` time and `O(chunk_size * n)` working memory per selection (plus one extra k-NN pass when `h="auto"`);
 - each iteration: one sparse matmul, `O(n k d)`.
 
-On an Apple MPS device a run on 3,240 points with `d` between 512 and 1152 takes about 0.5-0.7 s to converge (18-20 iterations). `torch.compile` is used for the k-NN, graph and distance kernels, so the first call for a new shape includes compilation time.
+With the defaults (no whitening), 402 of 405 benchmark runs (27 datasets x 5 encoders x 3 seeds, 200-4,000 points, `d` 512-1152) converged within the cap: a median of 50 iterations, 90th percentile 164, and some cells needing several hundred (the largest converged run took 988). The three that did not converge were the same dataset/encoder pair and had a final mean movement of about 1.5e-4, just above the threshold. About 19% of runs needed more than 100 iterations, so a cap of 100 stopped them early, and for some cells that changed the resulting scores noticeably. On an Apple MPS device the average run took about 0.7 s (whitening off). `torch.compile` is used for the k-NN, graph and distance kernels, so the first call for a new shape includes compilation time.
 
 ## Things to know
 

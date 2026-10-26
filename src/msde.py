@@ -536,7 +536,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         whiten_selection=False,
         whiten_regularization=1e-6,
         recompute_neighbors=0,
-        max_iters_shift=100,
+        max_iters_shift=1000,
         shift_threshold=1e-4,
         keep_trajectory=False,
         label_mode="same_label",
