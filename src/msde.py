@@ -21,9 +21,12 @@ movement converges. The pipeline, in the order ``MeanShiftDensityEnhancement.for
 6. **Repeat** (optionally re-selecting neighbours every ``recompute_neighbors`` iterations) until the mean
    per-point movement on the sphere drops below ``shift_threshold`` or ``max_iters_shift`` is reached.
 
-Stability scores (values in [0, 1], higher = more stable) default to 1.0 for every point and are never changed
-by the run; pass your own to ``forward``. The selection score and the neighbour weights can each be replaced by
-a callable (which carries its own parameters) passed to ``forward``.
+Stability scores (values in [0, 1], higher = more stable) start at 1.0 for every point. Pass a ``stability_fn`` to
+``forward`` and they are updated after every iteration from that iteration's step vectors; the updated scores feed
+the next neighbour weights and, whenever neighbours are reselected, the selection score. The selection score, the
+neighbour weights and the stability update can each be replaced by a callable (which carries its own parameters)
+passed to ``forward``; all three receive the index of the current iteration and the iteration cap, so they can
+change over the run.
 
 Only torch is required.
 """
@@ -80,7 +83,7 @@ def unit(X, eps=1e-12):
 
 
 @torch.no_grad()
-def whiten_points(X, regularization=1e-6):
+def whiten_points(X, regularization=1e-6, return_transform=False):
     """Centre ``X`` and rescale it by the inverse square root of its covariance.
 
     Euclidean distances between the returned rows are Mahalanobis distances of ``X``. The covariance is
@@ -89,13 +92,19 @@ def whiten_points(X, regularization=1e-6):
     eigenvalues, relative to their mean, which keeps near-degenerate directions (fewer points than features,
     constant features) from being blown up. The result is cast back to ``X``'s dtype before it is moved to
     its device (some devices have no float64).
+
+    With ``return_transform`` the result is ``(whitened, mean (d,), W (d, d))``, ``whitened == (X - mean) @ W``
+    up to rounding, so that other points can be mapped into the same space.
     """
     X64 = X.cpu().double()
     Xc = X64 - X64.mean(0, keepdim=True)
     evals, evecs = torch.linalg.eigh(Xc.T @ Xc / max(X.shape[0] - 1, 1))
     evals = evals.clamp_min(0.0)
     scale = (evals + regularization * evals.mean()).clamp_min(torch.finfo(torch.float64).tiny).rsqrt()
-    return (Xc @ (evecs * scale)).to(X.dtype).to(X.device)
+    whitened = (Xc @ (evecs * scale)).to(X.dtype).to(X.device)
+    if not return_transform:
+        return whitened
+    return whitened, X64.mean(0).to(X.dtype).to(X.device), (evecs * scale).to(X.dtype).to(X.device)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -353,10 +362,12 @@ class NeighborScore:
     ``h`` the kernel width.
 
     A replacement must have the same call signature and return a score of the same shape as ``dist``:
-    ``score(dist, density, stability, h)`` with ``dist`` a (chunk, n) block of distances from a chunk of
-    points to all points, ``density`` and ``stability`` the (n,) per-candidate vectors and ``h`` the kernel
-    width in use. Larger means more attractive; scores <= 0 mean "no attraction" and are only used to fill
-    slots once the positive scores run out (the nearest remaining candidates are taken). Scores must be finite.
+    ``score(dist, density, stability, h, iteration, n_iters)`` with ``dist`` a (chunk, n) block of distances
+    from a chunk of points to all points, ``density`` and ``stability`` the (n,) per-candidate vectors, ``h`` the
+    kernel width in use, ``iteration`` the 0-based index of the current iteration and ``n_iters`` the iteration
+    cap (``max_iters_shift``; the run may stop earlier by convergence). It is called whenever neighbours are
+    selected. Larger means more attractive; scores <= 0 mean "no attraction" and are only used to fill slots
+    once the positive scores run out (the nearest remaining candidates are taken). Scores must be finite.
     """
 
     def __init__(self, distance_strength=1.0, density_strength=1.0, stability_strength=1.0):
@@ -364,7 +375,7 @@ class NeighborScore:
         self.density_strength = _check_strength("density_strength", density_strength)
         self.stability_strength = _check_strength("stability_strength", stability_strength)
 
-    def __call__(self, dist, density, stability, h):
+    def __call__(self, dist, density, stability, h, iteration, n_iters):
         kernel = torch.exp(-self.distance_strength * dist.square() / (2.0 * h * h))
         return density.pow(self.density_strength) * stability.pow(self.stability_strength) * kernel
 
@@ -375,23 +386,26 @@ class NeighborWeight:
     The default neighbour weight (distance is ignored, so every selected neighbour counts according to how
     dense and stable it is). ``a`` and ``b`` are the density and stability strengths (>= 0).
 
-    A replacement must have the same call signature, ``weight(dist, density, stability, h)``, with all three
-    tensors of shape (n, k) for the k selected neighbours of every point (``dist`` the distances in the
-    selection space at selection time) and ``h`` the kernel width in use, and return non-negative finite (n, k)
-    weights. Weights are normalised per row afterwards, so only their ratios matter.
+    A replacement must have the same call signature, ``weight(dist, density, stability, h, iteration, n_iters)``,
+    with the three tensors of shape (n, k) for the k selected neighbours of every point (``dist`` the current
+    distances to them in the selection space, ``stability`` their current scores), ``h`` the kernel width in
+    use, ``iteration`` the 0-based index of the iteration whose step will use the weights and ``n_iters`` the
+    iteration cap (``max_iters_shift``). It returns non-negative finite (n, k) weights, normalised per row
+    afterwards, so only their ratios matter. A weight function you pass is evaluated at the start of every
+    iteration; the default is evaluated only when something it depends on can change.
     """
 
     def __init__(self, density_strength=1.0, stability_strength=1.0):
         self.density_strength = _check_strength("density_strength", density_strength)
         self.stability_strength = _check_strength("stability_strength", stability_strength)
 
-    def __call__(self, dist, density, stability, h):
+    def __call__(self, dist, density, stability, h, iteration, n_iters):
         return density.pow(self.density_strength) * stability.pow(self.stability_strength)
 
 
 @torch.no_grad()
 def select_neighbors(X, density, stability, k, h, score_fn, whiten=False, whiten_regularization=1e-6,
-                     labels=None, corpus_labels=None, chunk_size=1024):
+                     labels=None, corpus_labels=None, chunk_size=1024, iteration=0, n_iters=1):
     """The ``k`` best-scoring other points for every point of ``X``.
 
     Distances are Euclidean on ``X``, or, with ``whiten``, Euclidean in the whitened space of the current ``X``
@@ -400,15 +414,23 @@ def select_neighbors(X, density, stability, k, h, score_fn, whiten=False, whiten
     the remaining slots (if any) go to the nearest candidates. With ``labels`` a point may only pick points
     whose ``corpus_labels`` equal its label.
 
-    Returns ``(indices (n, k), dist (n, k), valid (n, k) bool or None, orphan (n,) bool or None, h)`` where
-    ``valid`` marks picks that respect the label mask, ``orphan`` marks points with no valid pick at all,
-    ``dist`` the distances to the picks in the selection space and ``h`` the kernel width used (``"auto"``
-    resolves to the median distance to the ``k`` nearest neighbours in that space).
+    ``iteration`` and ``n_iters`` are handed on to ``score_fn``.
+
+    Returns ``(indices (n, k), dist (n, k), valid (n, k) bool or None, orphan (n,) bool or None, h, transform)``
+    where ``valid`` marks picks that respect the label mask, ``orphan`` marks points with no valid pick at all,
+    ``dist`` the distances to the picks in the selection space, ``h`` the kernel width used (``"auto"`` resolves
+    to the median distance to the ``k`` nearest neighbours in that space) and ``transform`` is ``None`` or, with
+    ``whiten``, the ``(mean, W)`` that maps points into the selection space (see ``neighbor_distances``).
     """
     n = X.shape[0]
     if isinstance(k, bool) or not isinstance(k, int) or not 1 <= k <= n - 1:
         raise ValueError(f"k={k!r} is invalid for {n} points; expected an integer 1 <= k <= {n - 1}")
-    Z = whiten_points(X, whiten_regularization) if whiten else X
+    transform = None
+    if whiten:
+        Z, mean, W = whiten_points(X, whiten_regularization, return_transform=True)
+        transform = (mean, W)
+    else:
+        Z = X
     if h == "auto":
         h = median_neighbor_distance(Z, k)
     if labels is not None and corpus_labels is None:
@@ -420,7 +442,7 @@ def select_neighbors(X, density, stability, k, h, score_fn, whiten=False, whiten
     for start in range(0, n, chunk_size):
         end = min(n, start + chunk_size)
         d = torch.cdist(Z[start:end], Z)                                     # (c, n) distances in the selection space
-        score = score_fn(d, density, stability, h)
+        score = score_fn(d, density, stability, h, iteration, n_iters)
         if score.shape != d.shape or not bool(torch.isfinite(score).all()):
             raise ValueError("the selection score must be finite and have the shape of the distance block "
                              f"{tuple(d.shape)}; got {tuple(score.shape)}")
@@ -438,22 +460,35 @@ def select_neighbors(X, density, stability, k, h, score_fn, whiten=False, whiten
         valid[start:end] = torch.isfinite(top)
 
     if labels is None:
-        return indices, dist, None, None, h
-    return indices, dist, valid, ~valid.any(dim=1), h
+        return indices, dist, None, None, h, transform
+    return indices, dist, valid, ~valid.any(dim=1), h, transform
+
+
+@torch.no_grad()
+def neighbor_distances(X, indices, transform=None, chunk_size=256):
+    """Current distances (n, k) from every point of ``X`` to its selected neighbours ``indices``, in the selection
+    space: Euclidean on ``X``, or, if the selection whitened, Euclidean after mapping the points with the
+    ``(mean, W)`` transform of that selection."""
+    Z = X if transform is None else (X - transform[0]) @ transform[1]
+    out = torch.empty(indices.shape, dtype=X.dtype, device=X.device)
+    for start in range(0, X.shape[0], chunk_size):
+        end = min(X.shape[0], start + chunk_size)
+        out[start:end] = (Z[start:end].unsqueeze(1) - Z[indices[start:end]]).norm(dim=-1)
+    return out
 
 
 # ---------------------------------------------------------------------------------------------------------
 # Weighted-mean step
 # ---------------------------------------------------------------------------------------------------------
 @torch.no_grad()
-def prepare_step(indices, dist, density, stability, h, weight_fn, valid, n):
+def prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration=0, n_iters=1):
     """Normalised (n, k) neighbour weights and, where the device supports it, the sparse (n, n) weight matrix.
 
-    ``weight_fn`` is evaluated once here, at (re)selection time. The label-validity mask is applied and every
-    row is normalised to sum to 1 (a row with no weight at all stays zero, which leaves its point in place
-    once the step is renormalised onto the sphere).
+    ``weight_fn`` is evaluated here with the (n, k) tensors of the selected neighbours. The label-validity mask
+    is applied and every row is normalised to sum to 1 (a row with no weight at all stays zero, which leaves its
+    point in place once the step is renormalised onto the sphere).
     """
-    w = weight_fn(dist, density[indices], stability[indices], h)
+    w = weight_fn(dist, density[indices], stability[indices], h, iteration, n_iters)
     if w.shape != indices.shape or not bool(torch.isfinite(w).all()) or bool((w < 0).any()):
         raise ValueError("the neighbour weights must be finite, non-negative and have shape "
                          f"{tuple(indices.shape)}; got {tuple(w.shape)}")
@@ -483,6 +518,27 @@ def weighted_mean(X, indices, w, W, chunk_size=512):
         end = min(X.shape[0], start + chunk_size)
         out[start:end] = (w[start:end].unsqueeze(-1) * X[indices[start:end]]).sum(dim=1)
     return out
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Stability update
+# ---------------------------------------------------------------------------------------------------------
+@torch.no_grad()
+def update_stability(stability_fn, step, density, stability, h, iteration=0, n_iters=1):
+    """New (n,) stability scores from the latest step vectors.
+
+    ``stability_fn(step, density, stability, h, iteration, n_iters)`` gets the (n, d) displacement each point made
+    in the iteration that just finished, the (n,) density, the (n,) scores before this update, the kernel width
+    ``h``, the 0-based index of that iteration and the iteration cap, and must return finite (n,) scores within
+    [0, 1].
+    """
+    new = stability_fn(step, density, stability, h, iteration, n_iters)
+    if not isinstance(new, torch.Tensor) or new.shape != stability.shape:
+        raise ValueError(f"the stability scores must be a tensor of shape {tuple(stability.shape)}; "
+                         f"got {tuple(getattr(new, 'shape', ()))}")
+    if not (bool(torch.isfinite(new).all()) and bool((new >= 0).all()) and bool((new <= 1).all())):
+        raise ValueError("stability scores must be finite and within [0, 1]")
+    return new.to(device=stability.device, dtype=stability.dtype)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -603,7 +659,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         return (labels if self.label_mode == "same_label" else torch.zeros_like(labels)), labels
 
     @torch.no_grad()
-    def forward(self, X, gate=1.0, labels=None, stability=None, score_fn=None, weight_fn=None):
+    def forward(self, X, gate=1.0, labels=None, stability_fn=None, score_fn=None, weight_fn=None):
         """Run MSDE on the rows of ``X`` and return ``(shifted, total_distance, trajectory)``.
 
         shifted : (n, d) unit-norm points after the last iteration.
@@ -614,13 +670,27 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         gate : multiplier on the step size for this call.
         labels : optional (n,) integer labels restricting neighbour selection (see ``label_mode``). A point
             with no valid neighbour is left where it is.
-        stability : optional (n,) scores in [0, 1] (higher = more stable); default 1.0 for every point. They
-            are fixed for the whole run.
+        stability_fn : optional callable that updates the stability scores (higher = more stable, in [0, 1]) after
+            every iteration; it carries its own parameters. Called as
+            ``stability_fn(step, density, stability, h, iteration, n_iters)`` with ``step`` the (n, d) displacement
+            every point made in the iteration that just finished (new unit position minus old; zero for a point
+            left in place), ``density`` the (n,) density, ``stability`` the (n,) scores before this update (all 1.0
+            at the start), ``h`` the kernel width in use, ``iteration`` the 0-based index of that iteration and
+            ``n_iters`` the iteration cap (``max_iters_shift``); it returns the new (n,) scores, finite and within
+            [0, 1]. The first selection and the first step always use scores of 1.0 (there is no step yet). The
+            updated scores are used by the next iteration's neighbour weights and by every later neighbour
+            selection. Without a ``stability_fn`` the scores stay at 1.0. The final scores are available as
+            ``stability_`` afterwards.
         score_fn : optional replacement for the selection score (see ``NeighborScore``; it carries its own
-            parameters). It is used for every neighbour selection, including the initial one, so with
-            ``recompute_neighbors=0`` it determines the single neighbour graph the run uses.
-        weight_fn : optional replacement for the neighbour weights of the weighted mean (see
-            ``NeighborWeight``; it carries its own parameters). The default is used when not given.
+            parameters and receives ``iteration`` and ``n_iters``). It is used for every neighbour selection,
+            including the initial one: with ``recompute_neighbors=0`` it defines the single neighbour graph the
+            run uses, otherwise it is called again at every reselection.
+        weight_fn : optional replacement for the neighbour weights of the weighted mean (see ``NeighborWeight``;
+            it carries its own parameters and receives ``iteration`` and ``n_iters``). A function you pass is
+            evaluated at the start of **every** iteration, with the current distances to the selected neighbours
+            (in the selection space) and the current stability scores, so the weights follow the moving points
+            and the stability updates. The default is used when not given; it only depends on the density and
+            the stability, so it is re-evaluated only when a ``stability_fn`` is given.
         """
         X = torch.as_tensor(X)
         if X.dim() != 2 or not X.is_floating_point():
@@ -631,17 +701,12 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             raise ValueError(f"k={self.k} and n_neighbors={self.n_neighbors} need k <= n-1 and n_neighbors <= n "
                              f"for n={n} points")
 
-        if stability is None:
-            stability = torch.ones(n, dtype=X.dtype, device=X.device)
-        else:
-            stability = torch.as_tensor(stability, device=X.device, dtype=X.dtype)
-            if stability.dim() != 1 or stability.shape[0] != n:
-                raise ValueError(f"stability must be 1D with length n={n}; got shape {tuple(stability.shape)}")
-            if not (torch.isfinite(stability).all() and (stability >= 0).all() and (stability <= 1).all()):
-                raise ValueError("stability scores must be finite and within [0, 1]")
+        stability = torch.ones(n, dtype=X.dtype, device=X.device)           # every point starts fully stable
         query_labels, neighbor_labels = self._labels(labels, n)
         score_fn = score_fn if score_fn is not None else self.default_score
+        weights_every_iteration = weight_fn is not None or stability_fn is not None
         weight_fn = weight_fn if weight_fn is not None else self.default_weight
+        n_iters = self.max_iters_shift
 
         x = unit(X)                                                          # on the sphere from the start
         density = density_weights(
@@ -652,21 +717,27 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
 
         total_distance = torch.zeros(n, dtype=x.dtype, device=x.device)
         trajectory = [x.clone()] if self.keep_trajectory else []
-        state, orphan = None, None
-        for iteration in range(self.max_iters_shift):
-            if iteration == 0 or (self.recompute_neighbors and iteration % self.recompute_neighbors == 0):
-                indices, dist, valid, orphan, h = select_neighbors(
+        state, indices, dist, valid, orphan, h, transform = None, None, None, None, None, None, None
+        for iteration in range(n_iters):
+            selected = iteration == 0 or bool(self.recompute_neighbors and iteration % self.recompute_neighbors == 0)
+            if selected:
+                indices, dist, valid, orphan, h, transform = select_neighbors(
                     x, density, stability, self.k, self.h, score_fn,
                     whiten=self.whiten_selection, whiten_regularization=self.whiten_regularization,
                     labels=query_labels, corpus_labels=neighbor_labels, chunk_size=self.chunk_size,
+                    iteration=iteration, n_iters=n_iters,
                 )
-                state = prepare_step(indices, dist, density, stability, h, weight_fn, valid, n)
+            elif weights_every_iteration:
+                dist = neighbor_distances(x, indices, transform)             # distances at the current positions
+            if selected or weights_every_iteration:
+                state = prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters)
 
             mean = weighted_mean(x, *state[:3])
             moved = unit(x + self.learning_rate * gate * (mean - x))         # step, then back onto the sphere
             if orphan is not None:
                 moved = torch.where(orphan.unsqueeze(1), x, moved)
-            change = (moved - x).norm(dim=1)
+            step = moved - x                                                 # this iteration's step vectors
+            change = step.norm(dim=1)
 
             total_distance = total_distance + change
             x = moved
@@ -674,10 +745,13 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                 trajectory.append(x.clone())
             mean_change = change.mean().item()
             logger.debug("iteration %d: mean movement %.6f", iteration + 1, mean_change)
+            if stability_fn is not None:
+                stability = update_stability(stability_fn, step, density, stability, h, iteration, n_iters)
             if mean_change < self.shift_threshold:
                 logger.info("converged after %d iterations", iteration + 1)
                 break
 
+        self.stability_ = stability                                          # the final scores (1.0 without a stability_fn)
         return x, total_distance, trajectory
 
 

@@ -26,9 +26,9 @@ shifted, movement, trajectory = model(X)
    - find the smallest radius at which at least `satisfiability_proportion` of the points have more than `nbd_sample_count_threshold` others inside it (bisection, relaxed once if it fails);
    - a point's density is its number of other points within the radius, averaged over `max_iters_weight_count` radii shrinking linearly to zero.
 4. **Select neighbours.** In the geometry of the current points (Euclidean on the sphere, or Mahalanobis if `whiten_selection`), every other point is scored by `NeighborScore` and the `k` best are kept: with the default score `density^a * stability^b * exp(-c * d^2 / (2 h^2))`, so a dense, stable point can outrank a closer, sparse one. All points are candidates (no distance pre-filter) and a point is never its own neighbour. Candidates with a positive score rank by score; if fewer than `k` have one, the remaining slots go to the nearest candidates.
-5. **Weights.** Each selected neighbour gets a weight from `NeighborWeight` (default `density^a * stability^b`), evaluated at selection time; weights of picks that violate the label mask are zeroed and rows are normalised to sum to 1.
+5. **Weights.** Each selected neighbour gets a weight from `NeighborWeight` (default `density^a * stability^b`); weights of picks that violate the label mask are zeroed and rows are normalised to sum to 1. The default weights are computed when neighbours are selected (and again after every iteration if a `stability_fn` is given); a `weight_fn` you pass is evaluated at the start of every iteration, with the current distances to the selected neighbours.
 6. **Step.** `mean = W @ X` with `W` a sparse `(n, n)` matrix holding the `n*k` normalised weights (one sparse matmul), then `x' = normalise(x + learning_rate * gate * (mean - x))`.
-7. **Repeat** until the mean per-point movement on the sphere falls below `shift_threshold` (convergence) or `max_iters_shift` iterations have run. With `recompute_neighbors = N > 0`, stages 2, 4 and 5 are redone every `N` iterations on the current points (iterations 0, N, 2N, ...); the density is never recomputed.
+7. **Repeat** until the mean per-point movement on the sphere falls below `shift_threshold` (convergence) or `max_iters_shift` iterations have run. With `recompute_neighbors = N > 0`, stages 2 and 4 (the whitening, if on, and the neighbour selection) are redone every `N` iterations on the current points (iterations 0, N, 2N, ...); the density is never recomputed. A `weight_fn` and a `stability_fn`, if given, run in every iteration regardless of `recompute_neighbors`.
 
 ## Constructor
 
@@ -59,33 +59,44 @@ shifted, movement, trajectory = model(X)
 
 A strength is a number `>= 0`; 0 switches that factor off and larger values weight it more (they are exponents on density and stability, and a multiplier on the squared distance in the kernel).
 
-## `forward(X, gate=1.0, labels=None, stability=None, score_fn=None, weight_fn=None)`
+## `forward(X, gate=1.0, labels=None, stability_fn=None, score_fn=None, weight_fn=None)`
 
 | Argument | Meaning |
 | --- | --- |
 | `X` | `(n, d)` floating-point embeddings. |
 | `gate` | Multiplier on the step size for this call (0 leaves the points where they are). |
 | `labels` | `(n,)` integer labels restricting neighbour selection (see `label_mode`). A point with no valid neighbour is left where it is. |
-| `stability` | `(n,)` scores in `[0, 1]`, higher = more stable. Default: 1.0 for every point. Fixed for the whole run; never updated by it. |
-| `score_fn` | Replacement for the selection score. Used for **every** neighbour selection, including the initial one, so with `recompute_neighbors=0` it defines the single neighbour graph the run uses. |
-| `weight_fn` | Replacement for the neighbour weights of the weighted mean. Optional; the default is used when it is not given. |
+| `stability_fn` | Optional callable that updates the stability scores (`(n,)`, in `[0, 1]`, higher = more stable) after every iteration from that iteration's step vectors. Without one, every point stays at 1.0. See [Stability](#stability). |
+| `score_fn` | Replacement for the selection score. Called whenever neighbours are selected, including the initial selection, so with `recompute_neighbors=0` it defines the single neighbour graph the run uses. |
+| `weight_fn` | Replacement for the neighbour weights of the weighted mean. Evaluated at the start of **every** iteration, with the current distances and stability scores. The default is used when it is not given. |
 
-### Replacing the selection score and the neighbour weights
+### Replacing the selection score, the neighbour weights and the stability update
 
-Both are plain callables that carry their own parameters; the defaults are the callable classes `NeighborScore(distance_strength, density_strength, stability_strength)` and `NeighborWeight(density_strength, stability_strength)`.
+All three are plain callables that carry their own parameters, and all three receive the **0-based index of the current iteration** and the **iteration cap** `n_iters` (`max_iters_shift`; a run may stop earlier by convergence), so they can change over the run. The defaults are the callable classes `NeighborScore(distance_strength, density_strength, stability_strength)` and `NeighborWeight(density_strength, stability_strength)`.
 
 ```python
-score_fn(dist, density, stability, h) -> score        # dist: (chunk, n) distances from a chunk of points to all points
-                                                      # density, stability: (n,) per candidate; h: kernel width in use
-                                                      # score: (chunk, n), finite; larger = more attractive;
-                                                      # <= 0 means "no attraction" (only used to fill remaining slots)
+score_fn(dist, density, stability, h, iteration, n_iters) -> score
+    # dist: (chunk, n) distances from a chunk of points to all points; density, stability: (n,) per candidate
+    # h: kernel width in use; score: (chunk, n), finite; larger = more attractive;
+    # <= 0 means "no attraction" (only used to fill remaining slots)
 
-weight_fn(dist, density, stability, h) -> weights     # all (n, k): the k selected neighbours of every point
-                                                      # (dist = distances in the selection space at selection time)
-                                                      # weights: (n, k), finite and >= 0; normalised per row afterwards
+weight_fn(dist, density, stability, h, iteration, n_iters) -> weights
+    # dist, density, stability: (n, k), for the k selected neighbours of every point
+    # (dist = their CURRENT distances in the selection space, stability = their current scores)
+    # weights: (n, k), finite and >= 0; normalised per row afterwards
+
+stability_fn(step, density, stability, h, iteration, n_iters) -> stability
+    # step: (n, d) displacement of every point in the iteration that just finished; density, stability: (n,)
+    # returns (n,) scores in [0, 1]
 ```
 
-`dist` is measured in the selection space: Euclidean on the sphere, or whitened (Mahalanobis) if `whiten_selection`. Shape or value violations raise `ValueError`. Examples:
+| function | called | `iteration` is |
+| --- | --- | --- |
+| `score_fn` | whenever neighbours are selected: at the start, and every `recompute_neighbors` iterations after | the iteration whose step will use the selected neighbours |
+| `weight_fn` | at the start of every iteration, after any selection | the iteration whose step will use the weights |
+| `stability_fn` | after every iteration | the iteration that just finished |
+
+Within an iteration the order is: select neighbours (if due) → weights → step → stability update. A function with the old four-argument signature raises a `TypeError`. `dist` is measured in the selection space: Euclidean on the sphere, or whitened (Mahalanobis) if `whiten_selection`; for `weight_fn` it is recomputed from the current positions every iteration (with whitening, the transform from the last selection is reused). Shape or value violations raise `ValueError`. Examples:
 
 ```python
 from msde import MeanShiftDensityEnhancement, NeighborScore, NeighborWeight
@@ -93,20 +104,60 @@ import torch
 
 model = MeanShiftDensityEnhancement(k=30, recompute_neighbors=1)
 
-# stronger emphasis on stability, weaker on distance, chosen per call
-shifted, _, _ = model(X, stability=s, score_fn=NeighborScore(distance_strength=0.5, density_strength=1, stability_strength=2))
+# weaker emphasis on distance, stronger on stability, chosen per call
+shifted, _, _ = model(X, score_fn=NeighborScore(distance_strength=0.5, density_strength=1, stability_strength=2))
 
 # a custom score with its own parameter: ignore distance beyond a cutoff
-def cutoff_score(dist, density, stability, h, cutoff=3.0):
+def cutoff_score(dist, density, stability, h, iteration, n_iters, cutoff=3.0):
     return density * stability * (dist < cutoff * h)
 
-# distance-aware neighbour weights (attraction decays with distance); refreshed whenever neighbours are reselected
-def gravity_weight(dist, density, stability, h):
+# distance-aware neighbour weights: attraction decays with the points' current distance
+def gravity_weight(dist, density, stability, h, iteration, n_iters):
     return density * stability * torch.exp(-dist.square() / (2 * h * h))
 shifted, _, _ = model(X, weight_fn=gravity_weight)
+
+# a schedule: let the distance matter more and more as the run progresses
+class AnnealedScore:
+    def __init__(self, start=0.2, end=3.0):
+        self.start, self.end = start, end
+    def __call__(self, dist, density, stability, h, iteration, n_iters):
+        strength = self.start + (self.end - self.start) * iteration / max(n_iters - 1, 1)
+        return NeighborScore(distance_strength=strength)(dist, density, stability, h, iteration, n_iters)
+shifted, _, _ = model(X, score_fn=AnnealedScore())
 ```
 
-`weight_fn` is evaluated at each neighbour selection, with the distances of that moment. With `recompute_neighbors=0` that is once, at the start; to let distance-dependent weights follow the moving points, enable `recompute_neighbors`.
+With `recompute_neighbors=0` the neighbour graph is fixed after the first selection, so a `score_fn` is called once; the weights and the stability keep following the moving points through `weight_fn` and `stability_fn`.
+
+### Stability
+
+Every point starts with stability 1.0. A `stability_fn` (a callable that carries its own parameters) updates the scores **after every iteration** from what the points just did; its signature is given above. `step` is the displacement each point made in the iteration that just finished (new unit position minus old; zero for a point left in place), `stability` the scores before this update (all 1.0 at the start), so running updates are possible.
+
+- **Timing.** The first neighbour selection and the first step use scores of 1.0, since there is no step yet. After that the updated scores feed the neighbour weights of the next iteration (re-evaluated every iteration) and, whenever neighbours are reselected (`recompute_neighbors > 0`), the selection score. With `recompute_neighbors=0` the neighbour graph itself is fixed by the initial scores, but the weights on it still follow the stability.
+- **Result.** The final scores are available afterwards as `model.stability_` (all 1.0 without a `stability_fn`).
+- **A fixed set of scores** can be supplied with a closure, `stability_fn=lambda step, density, stability, h, iteration, n_iters: my_scores`; they take effect from the second iteration on.
+- **Cost.** Per iteration a `stability_fn` adds one call, and the weights are rebuilt (live distances `O(n k d)`, plus `O(n d^2)` for the whitening transform if `whiten_selection`, and the sparse weight matrix `O(n k log(n k))`). A `weight_fn` costs the same without the call. Nothing is added when neither is given, and the results are then identical to a run without these features.
+
+```python
+import torch
+
+def movers_unstable(step, density, stability, h, iteration, n_iters):
+    # a point that moves much more than the typical point in an iteration is unstable
+    size = step.norm(dim=1)
+    return torch.exp(-size / size.median().clamp_min(1e-9))
+
+class RunningStability:
+    # an exponential moving average of the same score, with its own parameter
+    def __init__(self, momentum=0.5):
+        self.momentum = momentum
+    def __call__(self, step, density, stability, h, iteration, n_iters):
+        size = step.norm(dim=1)
+        target = torch.exp(-size / size.median().clamp_min(1e-9))
+        return (1 - self.momentum) * stability + self.momentum * target
+
+model = MeanShiftDensityEnhancement(k=30, recompute_neighbors=1)
+shifted, movement, _ = model(X, stability_fn=RunningStability(momentum=0.3))
+scores = model.stability_            # (n,) in [0, 1]
+```
 
 ## The ridge
 
@@ -155,6 +206,6 @@ With the defaults (no whitening), 402 of 405 benchmark runs (27 datasets x 5 enc
 - **Density is computed once**, from the initial points (whitened if `whiten_density`), and is not refreshed by `recompute_neighbors`.
 - **Whitening needs `n` comfortably above `d`** (only relevant when it is on). With fewer points than dimensions the covariance is singular and the ridge decides the scale of the null directions; the result is finite but noisy. Embeddings with a very wide eigenvalue spread (1e8 and beyond) are handled in float64, but the smallest directions are still governed by `whiten_regularization`.
 - **`h` is in the units of the selection space.** With `whiten_selection` a numeric `h` is not comparable with raw embedding distances; `"auto"` adapts to the data either way.
-- **Stability is an input, not an output.** The run never changes it. To use a computed stability (for example from a first MSDE pass), pass it in `stability=`.
+- **Stability is computed during the run, not supplied as an array.** It starts at 1.0 and changes only if you pass a `stability_fn`; the first selection and step always use 1.0. To use scores computed elsewhere, return them from a `stability_fn` (they then act from the second iteration).
 - **A point whose weights are all zero stays put** after the step, up to float rounding (its mean is the zero vector, so the step scales it by `1 - learning_rate` and re-normalisation restores its direction).
 - **Small differences across devices.** CPU and MPS agree to about `1e-4` on the converged output; the movement AUROC differed by 0.003 in one run (iterated float32 arithmetic).
