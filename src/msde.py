@@ -26,7 +26,7 @@ Stability scores (values in [0, 1], higher = more stable) start at 1.0 for every
 the next neighbour weights and, whenever neighbours are reselected, the selection score. The selection score, the
 neighbour weights and the stability update can each be replaced by a callable (which carries its own parameters)
 passed to ``forward``; all three receive the index of the current iteration and the iteration cap, so they can
-change over the run.
+change over the run, and the UMAP fuzzy graph that was built for the density.
 
 Only torch is required.
 """
@@ -310,12 +310,17 @@ def _search_radius(S, layout, low, high, threshold, required, chunk_size, tol=1e
 
 @torch.no_grad()
 def density_weights(X, nbd_sample_count_threshold=30, n_neighbors=15, n_epochs=200, max_iters_weight_count=4,
-                    satisfiability_proportion=0.3, chunk_size=2048, whiten=False, whiten_regularization=1e-6):
+                    satisfiability_proportion=0.3, chunk_size=2048, whiten=False, whiten_regularization=1e-6,
+                    return_graph=False):
     """Empirical density of every row of ``X``, returned as an (n,) tensor (larger = denser).
 
     With ``whiten`` the points are whitened first (see ``whiten_points``; ``whiten_regularization`` is its ridge),
-    so the graph and the density are computed in Mahalanobis geometry instead of Euclidean. A fuzzy ``n_neighbors``-nearest-neighbour graph of ``X`` is built and its rows are compared as sparse
-    vectors (sparse matmul, ``chunk_size`` rows at a time). The radius is the smallest one at which at least
+    so the graph and the density are computed in Mahalanobis geometry instead of Euclidean.
+
+    A fuzzy ``n_neighbors``-nearest-neighbour graph of ``X`` (the UMAP fuzzy simplicial set: per-point scale,
+    fuzzy-union symmetrised weights in (0, 1], weak edges dropped) is built and its rows are compared as sparse
+    vectors (sparse matmul, ``chunk_size`` rows at a time). With ``return_graph`` the result is
+    ``(density, graph)`` where ``graph`` is that (n, n) coalesced sparse tensor. The radius is the smallest one at which at least
     ``satisfiability_proportion`` of the points have more than ``nbd_sample_count_threshold`` others inside
     it (found by bisection, relaxed once if that fails). The density of a point is its number of others
     within the radius, averaged over ``max_iters_weight_count`` radii shrinking linearly to zero.
@@ -341,7 +346,29 @@ def density_weights(X, nbd_sample_count_threshold=30, n_neighbors=15, n_epochs=2
     for _ in range(max_iters_weight_count):
         total = total + _radius_counts(S, layout, radius, chunk_size)
         radius = radius - delta
-    return total / max_iters_weight_count
+    density = total / max_iters_weight_count
+    return (density, S) if return_graph else density
+
+
+def _graph_rows(layout, start, end, n, dtype, device):
+    """Dense (end - start, n) block of the graph rows ``start:end`` (row-aligned with a distance block)."""
+    rows_sorted, cols_sorted, vals_sorted, row_ptr, _ = layout
+    lo, hi = row_ptr[start], row_ptr[end]
+    block = torch.zeros((end - start, n), dtype=dtype, device=device)
+    block[rows_sorted[lo:hi] - start, cols_sorted[lo:hi]] = vals_sorted[lo:hi].to(dtype)
+    return block
+
+
+@torch.no_grad()
+def graph_values_at(graph, indices):
+    """(n, k) fuzzy-graph weights of the pairs (i, indices[i, j]); 0 where the graph has no edge for a pair."""
+    n = graph.shape[0]
+    idx, vals = graph.indices(), graph.values()
+    keys = idx[0] * n + idx[1]                                    # sorted: a coalesced sparse tensor is ordered by (row, col)
+    query = (torch.arange(n, device=indices.device).unsqueeze(1) * n + indices).reshape(-1)
+    position = torch.searchsorted(keys, query).clamp_(max=keys.shape[0] - 1)
+    found = keys[position] == query
+    return torch.where(found, vals[position], torch.zeros_like(vals[position])).reshape(indices.shape)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -362,11 +389,13 @@ class NeighborScore:
     ``h`` the kernel width.
 
     A replacement must have the same call signature and return a score of the same shape as ``dist``:
-    ``score(dist, density, stability, h, iteration, n_iters)`` with ``dist`` a (chunk, n) block of distances
-    from a chunk of points to all points, ``density`` and ``stability`` the (n,) per-candidate vectors, ``h`` the
-    kernel width in use, ``iteration`` the 0-based index of the current iteration and ``n_iters`` the iteration
-    cap (``max_iters_shift``; the run may stop earlier by convergence). It is called whenever neighbours are
-    selected. Larger means more attractive; scores <= 0 mean "no attraction" and are only used to fill slots
+    ``score(dist, density, stability, h, iteration, n_iters, graph)`` with ``dist`` a (chunk, n) block of
+    distances from a chunk of points to all points, ``density`` and ``stability`` the (n,) per-candidate vectors,
+    ``h`` the kernel width in use, ``iteration`` the 0-based index of the current iteration, ``n_iters`` the
+    iteration cap (``max_iters_shift``; the run may stop earlier by convergence) and ``graph`` the (chunk, n)
+    dense rows of the UMAP fuzzy graph computed for the density, aligned with ``dist`` (``graph[r, j]`` is the
+    fuzzy weight of the edge from the point of row ``r`` to point ``j``, 0 where there is none). It is called
+    whenever neighbours are selected. Larger means more attractive; scores <= 0 mean "no attraction" and are only used to fill slots
     once the positive scores run out (the nearest remaining candidates are taken). Scores must be finite.
     """
 
@@ -375,7 +404,7 @@ class NeighborScore:
         self.density_strength = _check_strength("density_strength", density_strength)
         self.stability_strength = _check_strength("stability_strength", stability_strength)
 
-    def __call__(self, dist, density, stability, h, iteration, n_iters):
+    def __call__(self, dist, density, stability, h, iteration, n_iters, graph):
         kernel = torch.exp(-self.distance_strength * dist.square() / (2.0 * h * h))
         return density.pow(self.density_strength) * stability.pow(self.stability_strength) * kernel
 
@@ -386,11 +415,13 @@ class NeighborWeight:
     The default neighbour weight (distance is ignored, so every selected neighbour counts according to how
     dense and stable it is). ``a`` and ``b`` are the density and stability strengths (>= 0).
 
-    A replacement must have the same call signature, ``weight(dist, density, stability, h, iteration, n_iters)``,
-    with the three tensors of shape (n, k) for the k selected neighbours of every point (``dist`` the current
-    distances to them in the selection space, ``stability`` their current scores), ``h`` the kernel width in
-    use, ``iteration`` the 0-based index of the iteration whose step will use the weights and ``n_iters`` the
-    iteration cap (``max_iters_shift``). It returns non-negative finite (n, k) weights, normalised per row
+    A replacement must have the same call signature,
+    ``weight(dist, density, stability, h, iteration, n_iters, graph)``, with the tensors ``dist``, ``density``,
+    ``stability`` and ``graph`` of shape (n, k) for the k selected neighbours of every point (``dist`` the current
+    distances to them in the selection space, ``stability`` their current scores, ``graph`` the weight of the UMAP
+    fuzzy graph computed for the density between each point and each of its selected neighbours, 0 where the graph
+    has no such edge), ``h`` the kernel width in use, ``iteration`` the 0-based index of the iteration whose step
+    will use the weights and ``n_iters`` the iteration cap (``max_iters_shift``). It returns non-negative finite (n, k) weights, normalised per row
     afterwards, so only their ratios matter. A weight function you pass is evaluated at the start of every
     iteration; the default is evaluated only when something it depends on can change.
     """
@@ -399,12 +430,12 @@ class NeighborWeight:
         self.density_strength = _check_strength("density_strength", density_strength)
         self.stability_strength = _check_strength("stability_strength", stability_strength)
 
-    def __call__(self, dist, density, stability, h, iteration, n_iters):
+    def __call__(self, dist, density, stability, h, iteration, n_iters, graph):
         return density.pow(self.density_strength) * stability.pow(self.stability_strength)
 
 
 @torch.no_grad()
-def select_neighbors(X, density, stability, k, h, score_fn, whiten=False, whiten_regularization=1e-6,
+def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False, whiten_regularization=1e-6,
                      labels=None, corpus_labels=None, chunk_size=1024, iteration=0, n_iters=1):
     """The ``k`` best-scoring other points for every point of ``X``.
 
@@ -414,7 +445,8 @@ def select_neighbors(X, density, stability, k, h, score_fn, whiten=False, whiten
     the remaining slots (if any) go to the nearest candidates. With ``labels`` a point may only pick points
     whose ``corpus_labels`` equal its label.
 
-    ``iteration`` and ``n_iters`` are handed on to ``score_fn``.
+    ``iteration``, ``n_iters`` and the rows of the fuzzy ``graph`` (see ``density_weights``) are handed on to
+    ``score_fn``, a chunk of rows at a time.
 
     Returns ``(indices (n, k), dist (n, k), valid (n, k) bool or None, orphan (n,) bool or None, h, transform)``
     where ``valid`` marks picks that respect the label mask, ``orphan`` marks points with no valid pick at all,
@@ -436,13 +468,14 @@ def select_neighbors(X, density, stability, k, h, score_fn, whiten=False, whiten
     if labels is not None and corpus_labels is None:
         corpus_labels = labels
 
+    layout = _graph_layout(graph)
     indices = torch.empty((n, k), dtype=torch.long, device=X.device)
     dist = torch.empty((n, k), dtype=X.dtype, device=X.device)
     valid = torch.empty((n, k), dtype=torch.bool, device=X.device)
     for start in range(0, n, chunk_size):
         end = min(n, start + chunk_size)
         d = torch.cdist(Z[start:end], Z)                                     # (c, n) distances in the selection space
-        score = score_fn(d, density, stability, h, iteration, n_iters)
+        score = score_fn(d, density, stability, h, iteration, n_iters, _graph_rows(layout, start, end, n, X.dtype, X.device))
         if score.shape != d.shape or not bool(torch.isfinite(score).all()):
             raise ValueError("the selection score must be finite and have the shape of the distance block "
                              f"{tuple(d.shape)}; got {tuple(score.shape)}")
@@ -481,14 +514,15 @@ def neighbor_distances(X, indices, transform=None, chunk_size=256):
 # Weighted-mean step
 # ---------------------------------------------------------------------------------------------------------
 @torch.no_grad()
-def prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration=0, n_iters=1):
+def prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters, graph):
     """Normalised (n, k) neighbour weights and, where the device supports it, the sparse (n, n) weight matrix.
 
-    ``weight_fn`` is evaluated here with the (n, k) tensors of the selected neighbours. The label-validity mask
+    ``weight_fn`` is evaluated here with the (n, k) tensors of the selected neighbours; ``graph`` is the (n, k)
+    fuzzy-graph weights of the selected pairs (see ``graph_values_at``). The label-validity mask
     is applied and every row is normalised to sum to 1 (a row with no weight at all stays zero, which leaves its
     point in place once the step is renormalised onto the sphere).
     """
-    w = weight_fn(dist, density[indices], stability[indices], h, iteration, n_iters)
+    w = weight_fn(dist, density[indices], stability[indices], h, iteration, n_iters, graph)
     if w.shape != indices.shape or not bool(torch.isfinite(w).all()) or bool((w < 0).any()):
         raise ValueError("the neighbour weights must be finite, non-negative and have shape "
                          f"{tuple(indices.shape)}; got {tuple(w.shape)}")
@@ -524,15 +558,15 @@ def weighted_mean(X, indices, w, W, chunk_size=512):
 # Stability update
 # ---------------------------------------------------------------------------------------------------------
 @torch.no_grad()
-def update_stability(stability_fn, step, density, stability, h, iteration=0, n_iters=1):
+def update_stability(stability_fn, step, density, stability, h, iteration, n_iters, graph):
     """New (n,) stability scores from the latest step vectors.
 
-    ``stability_fn(step, density, stability, h, iteration, n_iters)`` gets the (n, d) displacement each point made
-    in the iteration that just finished, the (n,) density, the (n,) scores before this update, the kernel width
-    ``h``, the 0-based index of that iteration and the iteration cap, and must return finite (n,) scores within
-    [0, 1].
+    ``stability_fn(step, density, stability, h, iteration, n_iters, graph)`` gets the (n, d) displacement each point
+    made in the iteration that just finished, the (n,) density, the (n,) scores before this update, the kernel
+    width ``h``, the 0-based index of that iteration, the iteration cap and the full (n, n) sparse UMAP fuzzy
+    graph computed for the density, and must return finite (n,) scores within [0, 1].
     """
-    new = stability_fn(step, density, stability, h, iteration, n_iters)
+    new = stability_fn(step, density, stability, h, iteration, n_iters, graph)
     if not isinstance(new, torch.Tensor) or new.shape != stability.shape:
         raise ValueError(f"the stability scores must be a tensor of shape {tuple(stability.shape)}; "
                          f"got {tuple(getattr(new, 'shape', ()))}")
@@ -672,12 +706,12 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             with no valid neighbour is left where it is.
         stability_fn : optional callable that updates the stability scores (higher = more stable, in [0, 1]) after
             every iteration; it carries its own parameters. Called as
-            ``stability_fn(step, density, stability, h, iteration, n_iters)`` with ``step`` the (n, d) displacement
+            ``stability_fn(step, density, stability, h, iteration, n_iters, graph)`` with ``step`` the (n, d) displacement
             every point made in the iteration that just finished (new unit position minus old; zero for a point
             left in place), ``density`` the (n,) density, ``stability`` the (n,) scores before this update (all 1.0
             at the start), ``h`` the kernel width in use, ``iteration`` the 0-based index of that iteration and
-            ``n_iters`` the iteration cap (``max_iters_shift``); it returns the new (n,) scores, finite and within
-            [0, 1]. The first selection and the first step always use scores of 1.0 (there is no step yet). The
+            ``n_iters`` the iteration cap (``max_iters_shift``) and ``graph`` the full (n, n) sparse UMAP fuzzy graph
+            computed for the density; it returns the new (n,) scores, finite and within [0, 1]. The first selection and the first step always use scores of 1.0 (there is no step yet). The
             updated scores are used by the next iteration's neighbour weights and by every later neighbour
             selection. Without a ``stability_fn`` the scores stay at 1.0. The final scores are available as
             ``stability_`` afterwards.
@@ -709,28 +743,30 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         n_iters = self.max_iters_shift
 
         x = unit(X)                                                          # on the sphere from the start
-        density = density_weights(
+        density, graph = density_weights(
             x, self.nbd_sample_count_threshold, self.n_neighbors, self.n_epochs, self.max_iters_weight_count,
             self.satisfiability_proportion, self.weight_chunk_size,
-            whiten=self.whiten_density, whiten_regularization=self.whiten_regularization,
-        ).clamp_min(0.0).to(x.dtype)
+            whiten=self.whiten_density, whiten_regularization=self.whiten_regularization, return_graph=True,
+        )
+        density = density.clamp_min(0.0).to(x.dtype)
 
         total_distance = torch.zeros(n, dtype=x.dtype, device=x.device)
         trajectory = [x.clone()] if self.keep_trajectory else []
-        state, indices, dist, valid, orphan, h, transform = None, None, None, None, None, None, None
+        state, indices, dist, valid, orphan, h, transform, graph_pairs = None, None, None, None, None, None, None, None
         for iteration in range(n_iters):
             selected = iteration == 0 or bool(self.recompute_neighbors and iteration % self.recompute_neighbors == 0)
             if selected:
                 indices, dist, valid, orphan, h, transform = select_neighbors(
-                    x, density, stability, self.k, self.h, score_fn,
+                    x, density, stability, self.k, self.h, score_fn, graph,
                     whiten=self.whiten_selection, whiten_regularization=self.whiten_regularization,
                     labels=query_labels, corpus_labels=neighbor_labels, chunk_size=self.chunk_size,
                     iteration=iteration, n_iters=n_iters,
                 )
+                graph_pairs = graph_values_at(graph, indices).to(x.dtype)     # fuzzy-graph weight of every selected pair
             elif weights_every_iteration:
                 dist = neighbor_distances(x, indices, transform)             # distances at the current positions
             if selected or weights_every_iteration:
-                state = prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters)
+                state = prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters, graph_pairs)
 
             mean = weighted_mean(x, *state[:3])
             moved = unit(x + self.learning_rate * gate * (mean - x))         # step, then back onto the sphere
@@ -746,7 +782,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             mean_change = change.mean().item()
             logger.debug("iteration %d: mean movement %.6f", iteration + 1, mean_change)
             if stability_fn is not None:
-                stability = update_stability(stability_fn, step, density, stability, h, iteration, n_iters)
+                stability = update_stability(stability_fn, step, density, stability, h, iteration, n_iters, graph)
             if mean_change < self.shift_threshold:
                 logger.info("converged after %d iterations", iteration + 1)
                 break
