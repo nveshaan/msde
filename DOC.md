@@ -40,7 +40,6 @@ shifted, movement, trajectory = model(X)
 | `n_epochs` | 200 | Density: edges weaker than `max / n_epochs` are dropped from the graph. |
 | `max_iters_weight_count` | 4 | Density: number of shrinking radii averaged. |
 | `satisfiability_proportion` | 0.3 | Density: fraction of points that must satisfy the threshold. |
-| `weight_chunk_size` | 2048 | Density: rows handled at a time, both by the neighbour search that builds the fuzzy graph and by the graph-space distances. Lower it if memory runs out. It changes results only through floating-point rounding in the distances: in tests, 500 rows or more gave results identical to an unchunked run, while a very small value (64) shifted a few densities by about 0.1% and the final output by up to 0.015. |
 | `learning_rate` | 0.3 | Fraction of the way a point moves towards its weighted mean per iteration. |
 | `distance_strength` | 1.0 | Strength `c` of the distance term of the default selection score. |
 | `density_strength` | 1.0 | Strength `a` of the density term, in the default selection score and neighbour weight. |
@@ -54,7 +53,7 @@ shifted, movement, trajectory = model(X)
 | `shift_threshold` | 1e-4 | Convergence: stop when the mean per-point movement is below this. |
 | `keep_trajectory` | `False` | Also return the unit-norm state after every iteration. |
 | `label_mode` | `"same_label"` | How `labels` restrict neighbours: `"same_label"` (neighbours share the point's label) or `"zero_label"` (neighbours must have label 0, whatever the point's own label). |
-| `chunk_size` | 1024 | Rows of the `n x n` distance blocks held at once during selection. |
+| `chunk_size` | 1024 | Rows handled at a time by **every** chunked step, which bounds the memory of the run: the exact neighbour searches (the density graph and `h="auto"`), the graph-space distances of the density, the `(chunk, n)` blocks of the neighbour selection, and the `(chunk, k, d)` gathers of the live neighbour distances and of the weighted-mean fallback. Lower it if memory runs out. In principle it can change results through floating-point rounding in the distances (a different block shape can round differently); in tests it did not: sizes from 32 to 4096 gave identical outputs on synthetic data, and sizes from 256 to 4096 on ARMD OCT embeddings (MPS), with the same run time to within about 5%. |
 | `device` | auto | `"mps"`, `"cuda"` or `"cpu"`; inputs are moved there. |
 
 A strength is a number `>= 0`; 0 switches that factor off and larger values weight it more (they are exponents on density and stability, and a multiplier on the squared distance in the kernel).
@@ -212,7 +211,7 @@ Cost model (`n` points of dimension `d`; `P` about 20 counting passes, `q` = `n_
 
 - whitening (only if a flag is set): `O(n d^2 + d^3)` in float64 on the CPU, once for the density and at every neighbour reselection for the selection;
 - density: `O(n^2 d)` for the k-NN graph plus `O(P n^2 q)` for the counting passes, once;
-- selection: `O(n^2 d)` time and `O(chunk_size * n)` working memory per selection (plus one extra k-NN pass when `h="auto"`);
+- selection: `O(n^2 d)` time and `O(chunk_size * n)` working memory per selection (plus one extra k-NN pass when `h="auto"`); every chunked step uses the same `chunk_size`, so peak memory is about `chunk_size * n` values per block (several blocks at once during selection) or `chunk_size * k * d` for the neighbour gathers;
 - each iteration: one sparse matmul, `O(n k d)`.
 
 With the defaults (no whitening), 402 of 405 benchmark runs (27 datasets x 5 encoders x 3 seeds, 200-4,000 points, `d` 512-1152) converged within the cap: a median of 50 iterations, 90th percentile 164, and some cells needing several hundred (the largest converged run took 988). The three that did not converge were the same dataset/encoder pair and had a final mean movement of about 1.5e-4, just above the threshold. About 19% of runs needed more than 100 iterations, so a cap of 100 stopped them early, and for some cells that changed the resulting scores noticeably. On an Apple MPS device the average run took about 0.7 s (whitening off). `torch.compile` is used for the k-NN, graph and distance kernels, so the first call for a new shape includes compilation time.

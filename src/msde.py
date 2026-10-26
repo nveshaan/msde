@@ -41,6 +41,9 @@ DEFAULT_DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch
 
 LABEL_MODES = ("same_label", "zero_label")
 
+# Rows handled at a time by every chunked step (neighbour searches, density, selection blocks, gathers).
+DEFAULT_CHUNK_SIZE = 1024
+
 
 # ---------------------------------------------------------------------------------------------------------
 # Utilities
@@ -122,7 +125,7 @@ def _knn_kernel(k):
 
 
 @torch.no_grad()
-def knn(X, k, chunk_size=8192):
+def knn(X, k, chunk_size=DEFAULT_CHUNK_SIZE):
     """Exact Euclidean k-nearest neighbours of every row among all rows (itself included at distance 0).
 
     Returns ``(indices (n, k) int64, distances (n, k))``. A point's distance to itself is set to exactly 0:
@@ -146,12 +149,12 @@ def knn(X, k, chunk_size=8192):
 
 
 @torch.no_grad()
-def median_neighbor_distance(X, k):
+def median_neighbor_distance(X, k, chunk_size=DEFAULT_CHUNK_SIZE):
     """Median distance from a point to its ``k`` nearest other points: a data-driven kernel width."""
     n = X.shape[0]
     if n < 2:
         return 1.0
-    _, dist = knn(X, min(k, n - 1) + 1)                                  # column 0 is the point itself
+    _, dist = knn(X, min(k, n - 1) + 1, chunk_size=chunk_size)           # column 0 is the point itself
     return max(dist[:, 1:].median().item(), 1e-12)
 
 
@@ -223,7 +226,7 @@ def _fuzzy_graph(knn_indices, knn_dists, n, k, n_epochs):
     return rows[active], cols[active], w_sym[active]
 
 
-def _similarity_graph(X, n_neighbors, n_epochs, chunk_size=8192):
+def _similarity_graph(X, n_neighbors, n_epochs, chunk_size=DEFAULT_CHUNK_SIZE):
     """The fuzzy neighbour graph of ``X`` as a coalesced sparse (n, n) matrix. The exact neighbour search that
     feeds it works ``chunk_size`` rows at a time; everything after it is ``O(n * n_neighbors)``."""
     n = X.shape[0]
@@ -311,7 +314,7 @@ def _search_radius(S, layout, low, high, threshold, required, chunk_size, tol=1e
 
 @torch.no_grad()
 def density_weights(X, nbd_sample_count_threshold=30, n_neighbors=15, n_epochs=200, max_iters_weight_count=4,
-                    satisfiability_proportion=0.3, chunk_size=2048, whiten=False, whiten_regularization=1e-6,
+                    satisfiability_proportion=0.3, chunk_size=DEFAULT_CHUNK_SIZE, whiten=False, whiten_regularization=1e-6,
                     return_graph=False):
     """Empirical density of every row of ``X``, returned as an (n,) tensor (larger = denser).
 
@@ -438,7 +441,7 @@ class NeighborWeight:
 
 @torch.no_grad()
 def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False, whiten_regularization=1e-6,
-                     labels=None, corpus_labels=None, chunk_size=1024, iteration=0, n_iters=1):
+                     labels=None, corpus_labels=None, chunk_size=DEFAULT_CHUNK_SIZE, iteration=0, n_iters=1):
     """The ``k`` best-scoring other points for every point of ``X``.
 
     Distances are Euclidean on ``X``, or, with ``whiten``, Euclidean in the whitened space of the current ``X``
@@ -466,7 +469,7 @@ def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False,
     else:
         Z = X
     if h == "auto":
-        h = median_neighbor_distance(Z, k)
+        h = median_neighbor_distance(Z, k, chunk_size)
     if labels is not None and corpus_labels is None:
         corpus_labels = labels
 
@@ -500,7 +503,7 @@ def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False,
 
 
 @torch.no_grad()
-def neighbor_distances(X, indices, transform=None, chunk_size=256):
+def neighbor_distances(X, indices, transform=None, chunk_size=DEFAULT_CHUNK_SIZE):
     """Current distances (n, k) from every point of ``X`` to its selected neighbours ``indices``, in the selection
     space: Euclidean on ``X``, or, if the selection whitened, Euclidean after mapping the points with the
     ``(mean, W)`` transform of that selection."""
@@ -544,7 +547,7 @@ def prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iter
 
 
 @torch.no_grad()
-def weighted_mean(X, indices, w, W, chunk_size=512):
+def weighted_mean(X, indices, w, W, chunk_size=DEFAULT_CHUNK_SIZE):
     """Row-wise weighted mean of the selected neighbours: one sparse matmul ``W @ X`` (or, on a device without
     sparse matmul, a gather over row chunks)."""
     if W is not None:
@@ -586,8 +589,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
     Parameters
     ----------
     k : number of neighbours each point is pulled towards.
-    nbd_sample_count_threshold, n_neighbors, n_epochs, max_iters_weight_count, satisfiability_proportion,
-    weight_chunk_size : the density computation (see ``density_weights``).
+    nbd_sample_count_threshold, n_neighbors, n_epochs, max_iters_weight_count, satisfiability_proportion :
+        the density computation (see ``density_weights``).
     learning_rate : fraction of the way a point moves towards its weighted mean each iteration.
     density_strength, stability_strength, distance_strength : the strengths of the default selection score
         and neighbour weight (see ``NeighborScore`` and ``NeighborWeight``); >= 0, 0 switches a factor off.
@@ -606,7 +609,11 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
     keep_trajectory : also return the unit-norm state after every iteration.
     label_mode : how ``labels`` given to ``forward`` restrict neighbours: "same_label" (a point's neighbours
         must share its label) or "zero_label" (neighbours must have label 0, whatever the point's own label).
-    chunk_size : rows of the n x n distance blocks held at once during neighbour selection.
+    chunk_size : rows handled at a time by every chunked step, which bounds the memory of the run: the exact
+        neighbour searches (the density graph and ``h="auto"``), the graph-space distances of the density, the
+        (chunk, n) blocks of the neighbour selection, and the (chunk, k, d) gathers of the live neighbour
+        distances and of the weighted-mean fallback. Smaller uses less memory; results change only through
+        floating-point rounding.
     device : where the computation runs.
     """
 
@@ -618,7 +625,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         n_epochs=200,
         max_iters_weight_count=4,
         satisfiability_proportion=0.3,
-        weight_chunk_size=2048,
         learning_rate=0.3,
         density_strength=1.0,
         stability_strength=1.0,
@@ -632,7 +638,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         shift_threshold=1e-4,
         keep_trajectory=False,
         label_mode="same_label",
-        chunk_size=1024,
+        chunk_size=DEFAULT_CHUNK_SIZE,
         device=DEFAULT_DEVICE,
     ):
         super().__init__()
@@ -660,8 +666,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             raise ValueError("whiten_density and whiten_selection must be booleans")
         if label_mode not in LABEL_MODES:
             raise ValueError(f"label_mode must be one of {LABEL_MODES}; got {label_mode!r}")
-        if chunk_size < 1 or weight_chunk_size < 1:
-            raise ValueError("chunk_size and weight_chunk_size must be positive")
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+            raise ValueError(f"chunk_size must be a positive integer; got {chunk_size!r}")
 
         self.k = k
         self.nbd_sample_count_threshold = nbd_sample_count_threshold
@@ -669,7 +675,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.n_epochs = n_epochs
         self.max_iters_weight_count = max_iters_weight_count
         self.satisfiability_proportion = satisfiability_proportion
-        self.weight_chunk_size = weight_chunk_size
         self.learning_rate = learning_rate
         self.h = h
         self.whiten_density = whiten_density
@@ -747,7 +752,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         x = unit(X)                                                          # on the sphere from the start
         density, graph = density_weights(
             x, self.nbd_sample_count_threshold, self.n_neighbors, self.n_epochs, self.max_iters_weight_count,
-            self.satisfiability_proportion, self.weight_chunk_size,
+            self.satisfiability_proportion, self.chunk_size,
             whiten=self.whiten_density, whiten_regularization=self.whiten_regularization, return_graph=True,
         )
         density = density.clamp_min(0.0).to(x.dtype)
@@ -766,11 +771,11 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                 )
                 graph_pairs = graph_values_at(graph, indices).to(x.dtype)     # fuzzy-graph weight of every selected pair
             elif weights_every_iteration:
-                dist = neighbor_distances(x, indices, transform)             # distances at the current positions
+                dist = neighbor_distances(x, indices, transform, self.chunk_size)   # distances at the current positions
             if selected or weights_every_iteration:
                 state = prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters, graph_pairs)
 
-            mean = weighted_mean(x, *state[:3])
+            mean = weighted_mean(x, *state[:3], chunk_size=self.chunk_size)
             moved = unit(x + self.learning_rate * gate * (mean - x))         # step, then back onto the sphere
             if orphan is not None:
                 moved = torch.where(orphan.unsqueeze(1), x, moved)
