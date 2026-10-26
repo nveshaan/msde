@@ -5,14 +5,17 @@ movement converges. The pipeline, in the order ``MeanShiftDensityEnhancement.for
 
 1. **Normalise** the embeddings to unit length. They are re-normalised right after every shift, so every
    state the loop passes through (and the output) lies on the sphere.
-2. **Whiten** the points (centre, then rescale by the inverse square root of their covariance) so distances
-   are Mahalanobis distances: correlated, unevenly scaled directions no longer dominate.
-3. **Density**: an empirical density per point, computed once on the whitened initial points. A fuzzy
-   k-nearest-neighbour graph is built; points are then compared as rows of that sparse graph (sparse matmul),
-   and a point's density is the average number of other points within a radius, over a few shrinking radii.
-4. **Select neighbours**: every other point is scored by ``NeighborScore`` (distance x density x stability,
-   distance measured in whitened space) and the ``k`` best-scoring ones are kept. A dense, stable point can
-   outrank a closer, sparse one.
+2. **Whitening** (optional, off by default): centre the points and rescale them by the inverse square root of
+   their covariance, so distances become Mahalanobis distances and correlated, unevenly scaled directions no
+   longer dominate. It can be switched on separately for the density and for the neighbour selection
+   (``whiten_density``, ``whiten_selection``); the step itself always works on the unit sphere.
+3. **Density**: an empirical density per point, computed once on the initial points (whitened if
+   ``whiten_density``). A fuzzy k-nearest-neighbour graph is built; points are then compared as rows of that
+   sparse graph (sparse matmul), and a point's density is the average number of other points within a
+   radius, over a few shrinking radii.
+4. **Select neighbours**: every other point is scored by ``NeighborScore`` (distance x density x stability;
+   distance measured in the whitened space if ``whiten_selection``, else on the sphere) and the ``k``
+   best-scoring ones are kept. A dense, stable point can outrank a closer, sparse one.
 5. **Step**: each point moves a fraction ``learning_rate`` towards the weighted mean of its selected neighbours
    (weights from ``NeighborWeight``), computed with one sparse matmul ``W @ X``; it is then put back on the sphere.
 6. **Repeat** (optionally re-selecting neighbours every ``recompute_neighbors`` iterations) until the mean
@@ -77,7 +80,7 @@ def unit(X, eps=1e-12):
 
 
 @torch.no_grad()
-def whiten(X, regularization=1e-6):
+def whiten_points(X, regularization=1e-6):
     """Centre ``X`` and rescale it by the inverse square root of its covariance.
 
     Euclidean distances between the returned rows are Mahalanobis distances of ``X``. The covariance is
@@ -298,15 +301,18 @@ def _search_radius(S, layout, low, high, threshold, required, chunk_size, tol=1e
 
 @torch.no_grad()
 def density_weights(X, nbd_sample_count_threshold=30, n_neighbors=15, n_epochs=200, max_iters_weight_count=4,
-                    satisfiability_proportion=0.3, chunk_size=2048):
+                    satisfiability_proportion=0.3, chunk_size=2048, whiten=False, whiten_regularization=1e-6):
     """Empirical density of every row of ``X``, returned as an (n,) tensor (larger = denser).
 
-    A fuzzy ``n_neighbors``-nearest-neighbour graph of ``X`` is built and its rows are compared as sparse
+    With ``whiten`` the points are whitened first (see ``whiten_points``; ``whiten_regularization`` is its ridge),
+    so the graph and the density are computed in Mahalanobis geometry instead of Euclidean. A fuzzy ``n_neighbors``-nearest-neighbour graph of ``X`` is built and its rows are compared as sparse
     vectors (sparse matmul, ``chunk_size`` rows at a time). The radius is the smallest one at which at least
     ``satisfiability_proportion`` of the points have more than ``nbd_sample_count_threshold`` others inside
     it (found by bisection, relaxed once if that fails). The density of a point is its number of others
     within the radius, averaged over ``max_iters_weight_count`` radii shrinking linearly to zero.
     """
+    if whiten:
+        X = whiten_points(X, whiten_regularization)
     n = X.shape[0]
     S = _similarity_graph(X, n_neighbors, n_epochs)
     layout = _graph_layout(S)
@@ -342,8 +348,9 @@ class NeighborScore:
     """How attractive every candidate is to a point: ``density^a * stability^b * exp(-c * d^2 / (2 h^2))``.
 
     The default selection score. ``a``, ``b`` and ``c`` are the density, stability and distance strengths
-    (>= 0; 0 switches that factor off, larger values weight it more). ``d`` is the whitened-space distance
-    between the point and the candidate and ``h`` the kernel width.
+    (>= 0; 0 switches that factor off, larger values weight it more). ``d`` is the distance between the point and
+    the candidate in the selection space (Euclidean on the sphere, or Mahalanobis if the selection whitens) and
+    ``h`` the kernel width.
 
     A replacement must have the same call signature and return a score of the same shape as ``dist``:
     ``score(dist, density, stability, h)`` with ``dist`` a (chunk, n) block of distances from a chunk of
@@ -369,8 +376,8 @@ class NeighborWeight:
     dense and stable it is). ``a`` and ``b`` are the density and stability strengths (>= 0).
 
     A replacement must have the same call signature, ``weight(dist, density, stability, h)``, with all three
-    tensors of shape (n, k) for the k selected neighbours of every point (``dist`` the whitened-space
-    distances at selection time) and ``h`` the kernel width in use, and return non-negative finite (n, k)
+    tensors of shape (n, k) for the k selected neighbours of every point (``dist`` the distances in the
+    selection space at selection time) and ``h`` the kernel width in use, and return non-negative finite (n, k)
     weights. Weights are normalised per row afterwards, so only their ratios matter.
     """
 
@@ -383,24 +390,25 @@ class NeighborWeight:
 
 
 @torch.no_grad()
-def select_neighbors(X, density, stability, k, h, score_fn, whiten_regularization=1e-6,
+def select_neighbors(X, density, stability, k, h, score_fn, whiten=False, whiten_regularization=1e-6,
                      labels=None, corpus_labels=None, chunk_size=1024):
     """The ``k`` best-scoring other points for every point of ``X``.
 
-    Distances are measured in the whitened space of the current ``X``. All other points are candidates (no
+    Distances are Euclidean on ``X``, or, with ``whiten``, Euclidean in the whitened space of the current ``X``
+    (Mahalanobis; ``whiten_regularization`` is the ridge of ``whiten_points``). All other points are candidates (no
     distance pre-filter); a point is never its own neighbour. Candidates with a positive score rank by score,
     the remaining slots (if any) go to the nearest candidates. With ``labels`` a point may only pick points
     whose ``corpus_labels`` equal its label.
 
     Returns ``(indices (n, k), dist (n, k), valid (n, k) bool or None, orphan (n,) bool or None, h)`` where
     ``valid`` marks picks that respect the label mask, ``orphan`` marks points with no valid pick at all,
-    ``dist`` the whitened-space distances to the picks and ``h`` the kernel width used (``"auto"`` resolves
-    to the median whitened-space distance to the ``k`` nearest neighbours).
+    ``dist`` the distances to the picks in the selection space and ``h`` the kernel width used (``"auto"``
+    resolves to the median distance to the ``k`` nearest neighbours in that space).
     """
     n = X.shape[0]
     if isinstance(k, bool) or not isinstance(k, int) or not 1 <= k <= n - 1:
         raise ValueError(f"k={k!r} is invalid for {n} points; expected an integer 1 <= k <= {n - 1}")
-    Z = whiten(X, whiten_regularization)
+    Z = whiten_points(X, whiten_regularization) if whiten else X
     if h == "auto":
         h = median_neighbor_distance(Z, k)
     if labels is not None and corpus_labels is None:
@@ -411,7 +419,7 @@ def select_neighbors(X, density, stability, k, h, score_fn, whiten_regularizatio
     valid = torch.empty((n, k), dtype=torch.bool, device=X.device)
     for start in range(0, n, chunk_size):
         end = min(n, start + chunk_size)
-        d = torch.cdist(Z[start:end], Z)                                     # (c, n) whitened distances
+        d = torch.cdist(Z[start:end], Z)                                     # (c, n) distances in the selection space
         score = score_fn(d, density, stability, h)
         if score.shape != d.shape or not bool(torch.isfinite(score).all()):
             raise ValueError("the selection score must be finite and have the shape of the distance block "
@@ -491,12 +499,16 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
     learning_rate : fraction of the way a point moves towards its weighted mean each iteration.
     density_strength, stability_strength, distance_strength : the strengths of the default selection score
         and neighbour weight (see ``NeighborScore`` and ``NeighborWeight``); >= 0, 0 switches a factor off.
-    h : kernel width of the distance term, a positive number in whitened units, or "auto" (median distance
-        to the ``k`` nearest neighbours, re-estimated every time neighbours are selected).
-    whiten_regularization : relative ridge of the whitening (see ``whiten``).
+    h : kernel width of the distance term, a positive number in the units of the selection space (whitened
+        units if ``whiten_selection``), or "auto" (median distance to the ``k`` nearest neighbours,
+        re-estimated every time neighbours are selected).
+    whiten_density, whiten_selection : whether the density computation / the neighbour selection measure
+        distances in whitened (Mahalanobis) instead of Euclidean geometry. Both default to False.
+    whiten_regularization : the ridge of the whitening (see ``whiten_points``); only used when one of the two
+        flags is set.
     recompute_neighbors : 0 or None selects neighbours once, from the initial points; a positive N reselects
-        every N iterations (iterations 0, N, 2N, ...), re-estimating the whitening on the current points and
-        re-evaluating the neighbour weights.
+        every N iterations (iterations 0, N, 2N, ...), re-estimating the whitening (if on) on the current
+        points and re-evaluating the neighbour weights.
     max_iters_shift, shift_threshold : the loop stops when the mean per-point movement on the sphere is below
         ``shift_threshold`` (convergence) or after ``max_iters_shift`` iterations (a safety cap).
     keep_trajectory : also return the unit-norm state after every iteration.
@@ -520,6 +532,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         stability_strength=1.0,
         distance_strength=1.0,
         h="auto",
+        whiten_density=False,
+        whiten_selection=False,
         whiten_regularization=1e-6,
         recompute_neighbors=0,
         max_iters_shift=100,
@@ -550,6 +564,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             raise ValueError("shift_threshold must be >= 0")
         if not whiten_regularization >= 0:
             raise ValueError("whiten_regularization must be >= 0")
+        if not isinstance(whiten_density, bool) or not isinstance(whiten_selection, bool):
+            raise ValueError("whiten_density and whiten_selection must be booleans")
         if label_mode not in LABEL_MODES:
             raise ValueError(f"label_mode must be one of {LABEL_MODES}; got {label_mode!r}")
         if chunk_size < 1 or weight_chunk_size < 1:
@@ -564,6 +580,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.weight_chunk_size = weight_chunk_size
         self.learning_rate = learning_rate
         self.h = h
+        self.whiten_density = whiten_density
+        self.whiten_selection = whiten_selection
         self.whiten_regularization = whiten_regularization
         self.recompute_neighbors = recompute_neighbors or 0
         self.max_iters_shift = max_iters_shift
@@ -627,8 +645,9 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
 
         x = unit(X)                                                          # on the sphere from the start
         density = density_weights(
-            whiten(x, self.whiten_regularization), self.nbd_sample_count_threshold, self.n_neighbors,
-            self.n_epochs, self.max_iters_weight_count, self.satisfiability_proportion, self.weight_chunk_size,
+            x, self.nbd_sample_count_threshold, self.n_neighbors, self.n_epochs, self.max_iters_weight_count,
+            self.satisfiability_proportion, self.weight_chunk_size,
+            whiten=self.whiten_density, whiten_regularization=self.whiten_regularization,
         ).clamp_min(0.0).to(x.dtype)
 
         total_distance = torch.zeros(n, dtype=x.dtype, device=x.device)
@@ -637,7 +656,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         for iteration in range(self.max_iters_shift):
             if iteration == 0 or (self.recompute_neighbors and iteration % self.recompute_neighbors == 0):
                 indices, dist, valid, orphan, h = select_neighbors(
-                    x, density, stability, self.k, self.h, score_fn, self.whiten_regularization,
+                    x, density, stability, self.k, self.h, score_fn,
+                    whiten=self.whiten_selection, whiten_regularization=self.whiten_regularization,
                     labels=query_labels, corpus_labels=neighbor_labels, chunk_size=self.chunk_size,
                 )
                 state = prepare_step(indices, dist, density, stability, h, weight_fn, valid, n)
