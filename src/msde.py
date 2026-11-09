@@ -5,29 +5,24 @@ movement converges. The pipeline, in the order ``MeanShiftDensityEnhancement.for
 
 1. **Normalise** the embeddings to unit length. They are re-normalised right after every shift, so every
    state the loop passes through (and the output) lies on the sphere.
-2. **Whitening** (optional, off by default): centre the points and rescale them by the inverse square root of
-   their covariance, so distances become Mahalanobis distances and correlated, unevenly scaled directions no
-   longer dominate. It can be switched on separately for the density and for the neighbour selection
-   (``whiten_density``, ``whiten_selection``); the step itself always works on the unit sphere.
-3. **Density**: an empirical density per point, computed once on the initial points (whitened if
-   ``whiten_density``). A fuzzy k-nearest-neighbour graph is built; points are then compared as rows of that
+2. **Density**: an empirical density per point, computed once on the initial points (or, with a ``density_fn``, at every iteration). A fuzzy k-nearest-neighbour graph is built; points are then compared as rows of that
    sparse graph (sparse matmul), and a point's density is the average number of other points within a
    radius, over a few shrinking radii.
-4. **Select neighbours**: every other point is scored by ``NeighborScore`` (distance x density x stability;
-   distance measured in the whitened space if ``whiten_selection``, else on the sphere) and the ``k``
+3. **Select neighbours**: every other point is scored by ``NeighborScore`` (distance x density x stability;
+   distance measured on the sphere) and the ``k``
    best-scoring ones are kept. A dense, stable point can outrank a closer, sparse one.
-5. **Step**: each point moves a fraction ``learning_rate`` towards the weighted mean of its selected neighbours
+4. **Step**: each point moves a fraction ``learning_rate`` towards the weighted mean of its selected neighbours
    (weights from ``NeighborWeight``), computed with one sparse matmul ``W @ X``; it is then put back on the sphere.
-6. **Repeat** (optionally re-selecting neighbours every ``recompute_neighbors`` iterations) until the mean
+5. **Repeat** (optionally re-selecting neighbours every ``recompute_neighbors`` iterations) until the mean
    per-point movement on the sphere drops below ``shift_threshold`` or ``max_iters_shift`` is reached.
 
 Stability scores (values in [0, 1], higher = more stable) start at 1.0 for every point. Pass a ``stability_fn`` to
 ``forward`` and they are updated after every iteration from that iteration's step vectors; the updated scores feed
-the next neighbour weights and, whenever neighbours are reselected, the selection score. The selection score, the
+the next neighbour weights and, whenever neighbours are reselected, the selection score. The density, the selection score, the
 neighbour weights and the stability update can each be replaced by a callable (which carries its own parameters)
-passed to ``forward``; all three receive the index of the current iteration and the iteration cap, so they can
+passed to ``forward``; all of them receive the index of the current iteration and the iteration cap, so they can
 change over the run, and the UMAP fuzzy graph that was built for the density. ``forward`` also creates one empty
-dict before the first iteration; all three callables receive it and return it (updated) with their result, so they
+dict before the first iteration; all four callables receive it and return it (updated) with their result, so they
 can remember things across calls and share them.
 
 Only torch is required.
@@ -42,6 +37,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 
 LABEL_MODES = ("same_label", "zero_label")
+METRICS = ("euclidean", "cosine")
 
 # Rows handled at a time by every chunked step (neighbour searches, density, selection blocks, gathers).
 DEFAULT_CHUNK_SIZE = 1024
@@ -87,29 +83,12 @@ def unit(X, eps=1e-12):
     return X / X.norm(dim=1, keepdim=True).clamp_min(eps)
 
 
-@torch.no_grad()
-def whiten_points(X, regularization=1e-6, return_transform=False):
-    """Centre ``X`` and rescale it by the inverse square root of its covariance.
-
-    Euclidean distances between the returned rows are Mahalanobis distances of ``X``. The covariance is
-    accumulated and decomposed in float64 on the CPU: forming it in float32 squares the condition number
-    and loses the small eigenvalues of typical embeddings. ``regularization`` is a ridge added to the
-    eigenvalues, relative to their mean, which keeps near-degenerate directions (fewer points than features,
-    constant features) from being blown up. The result is cast back to ``X``'s dtype before it is moved to
-    its device (some devices have no float64).
-
-    With ``return_transform`` the result is ``(whitened, mean (d,), W (d, d))``, ``whitened == (X - mean) @ W``
-    up to rounding, so that other points can be mapped into the same space.
-    """
-    X64 = X.cpu().double()
-    Xc = X64 - X64.mean(0, keepdim=True)
-    evals, evecs = torch.linalg.eigh(Xc.T @ Xc / max(X.shape[0] - 1, 1))
-    evals = evals.clamp_min(0.0)
-    scale = (evals + regularization * evals.mean()).clamp_min(torch.finfo(torch.float64).tiny).rsqrt()
-    whitened = (Xc @ (evecs * scale)).to(X.dtype).to(X.device)
-    if not return_transform:
-        return whitened
-    return whitened, X64.mean(0).to(X.dtype).to(X.device), (evecs * scale).to(X.dtype).to(X.device)
+def pairwise_distance(A, B, metric="euclidean"):
+    """(len(A), len(B)) distances between the rows of ``A`` and ``B``: Euclidean, or cosine (``1 - cos``, which
+    for the unit-norm rows the pipeline works on is half the squared Euclidean distance)."""
+    if metric == "cosine":
+        return (1.0 - A @ B.T / (A.norm(dim=1, keepdim=True) * B.norm(dim=1)).clamp_min(1e-12)).clamp_min(0.0)
+    return torch.cdist(A, B)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -118,17 +97,18 @@ def whiten_points(X, regularization=1e-6, return_transform=False):
 _KNN_KERNELS = {}
 
 
-def _knn_kernel(k):
-    if k not in _KNN_KERNELS:
+def _knn_kernel(k, metric):
+    if (k, metric) not in _KNN_KERNELS:
         def _kernel(X_chunk, X_full):
-            return torch.cdist(X_chunk, X_full).topk(k, largest=False, dim=1)     # (chunk, n): all-pairs
-        _KNN_KERNELS[k] = torch.compile(_kernel, fullgraph=True)
-    return _KNN_KERNELS[k]
+            return pairwise_distance(X_chunk, X_full, metric).topk(k, largest=False, dim=1)   # (chunk, n): all-pairs
+        _KNN_KERNELS[(k, metric)] = torch.compile(_kernel, fullgraph=True)
+    return _KNN_KERNELS[(k, metric)]
 
 
 @torch.no_grad()
-def knn(X, k, chunk_size=DEFAULT_CHUNK_SIZE):
-    """Exact Euclidean k-nearest neighbours of every row among all rows (itself included at distance 0).
+def knn(X, k, chunk_size=DEFAULT_CHUNK_SIZE, metric="euclidean"):
+    """Exact k-nearest neighbours of every row among all rows (itself included at distance 0), by
+    Euclidean or cosine distance (``metric``).
 
     Returns ``(indices (n, k) int64, distances (n, k))``. A point's distance to itself is set to exactly 0:
     the matmul-based ``cdist`` leaves platform-dependent rounding noise there that would otherwise be
@@ -138,7 +118,7 @@ def knn(X, k, chunk_size=DEFAULT_CHUNK_SIZE):
         raise ValueError(f"k={k!r} is invalid for {X.shape[0]} points; expected an integer 1 <= k <= {X.shape[0]}")
     X = X.detach()
     n = X.shape[0]
-    kernel = _knn_kernel(k)
+    kernel = _knn_kernel(k, metric)
     all_idx = torch.empty((n, k), dtype=torch.long, device=X.device)
     all_dist = torch.empty((n, k), dtype=X.dtype, device=X.device)
     for start in range(0, n, chunk_size):
@@ -151,12 +131,12 @@ def knn(X, k, chunk_size=DEFAULT_CHUNK_SIZE):
 
 
 @torch.no_grad()
-def median_neighbor_distance(X, k, chunk_size=DEFAULT_CHUNK_SIZE):
+def median_neighbor_distance(X, k, chunk_size=DEFAULT_CHUNK_SIZE, metric="euclidean"):
     """Median distance from a point to its ``k`` nearest other points: a data-driven kernel width."""
     n = X.shape[0]
     if n < 2:
         return 1.0
-    _, dist = knn(X, min(k, n - 1) + 1, chunk_size=chunk_size)           # column 0 is the point itself
+    _, dist = knn(X, min(k, n - 1) + 1, chunk_size=chunk_size, metric=metric)           # column 0 is the point itself
     return max(dist[:, 1:].median().item(), 1e-12)
 
 
@@ -228,11 +208,11 @@ def _fuzzy_graph(knn_indices, knn_dists, n, k, n_epochs):
     return rows[active], cols[active], w_sym[active]
 
 
-def _similarity_graph(X, n_neighbors, n_epochs, chunk_size=DEFAULT_CHUNK_SIZE):
+def _similarity_graph(X, n_neighbors, n_epochs, chunk_size=DEFAULT_CHUNK_SIZE, metric="euclidean"):
     """The fuzzy neighbour graph of ``X`` as a coalesced sparse (n, n) matrix. The exact neighbour search that
     feeds it works ``chunk_size`` rows at a time; everything after it is ``O(n * n_neighbors)``."""
     n = X.shape[0]
-    knn_idx, knn_dist = knn(X, n_neighbors, chunk_size=chunk_size)
+    knn_idx, knn_dist = knn(X, n_neighbors, chunk_size=chunk_size, metric=metric)
     rows, cols, vals = _fuzzy_graph(knn_idx, knn_dist, n, n_neighbors, n_epochs)
     return torch.sparse_coo_tensor(
         torch.stack([rows, cols]), vals, size=(n, n), device=X.device, check_invariants=False,
@@ -315,27 +295,18 @@ def _search_radius(S, layout, low, high, threshold, required, chunk_size, tol=1e
 
 
 @torch.no_grad()
-def density_weights(X, nbd_sample_count_threshold=30, n_neighbors=15, n_epochs=200, max_iters_weight_count=4,
-                    satisfiability_proportion=0.3, chunk_size=DEFAULT_CHUNK_SIZE, whiten=False, whiten_regularization=1e-6,
-                    return_graph=False):
-    """Empirical density of every row of ``X``, returned as an (n,) tensor (larger = denser).
+def graph_density(S, nbd_sample_count_threshold=30, max_iters_weight_count=4, satisfiability_proportion=0.3,
+                  chunk_size=DEFAULT_CHUNK_SIZE):
+    """Empirical density of every row of the fuzzy graph ``S`` (an (n, n) coalesced sparse tensor), as an (n,)
+    tensor (larger = denser).
 
-    With ``whiten`` the points are whitened first (see ``whiten_points``; ``whiten_regularization`` is its ridge),
-    so the graph and the density are computed in Mahalanobis geometry instead of Euclidean.
-
-    A fuzzy ``n_neighbors``-nearest-neighbour graph of ``X`` (the UMAP fuzzy simplicial set: per-point scale,
-    fuzzy-union symmetrised weights in (0, 1], weak edges dropped) is built and its rows are compared as sparse
-    vectors (sparse matmul). ``chunk_size`` is the number of rows handled at a time, both by the exact neighbour
-    search that builds the graph and by those graph-space distances; it bounds the memory of the whole computation. With ``return_graph`` the result is
-    ``(density, graph)`` where ``graph`` is that (n, n) coalesced sparse tensor. The radius is the smallest one at which at least
-    ``satisfiability_proportion`` of the points have more than ``nbd_sample_count_threshold`` others inside
-    it (found by bisection, relaxed once if that fails). The density of a point is its number of others
-    within the radius, averaged over ``max_iters_weight_count`` radii shrinking linearly to zero.
+    The rows of ``S`` are compared as sparse vectors (sparse matmul), ``chunk_size`` rows at a time. The radius
+    is the smallest one at which at least ``satisfiability_proportion`` of the points have more than
+    ``nbd_sample_count_threshold`` others inside it (found by bisection, relaxed once if that fails). The density
+    of a point is its number of others within the radius, averaged over ``max_iters_weight_count`` radii
+    shrinking linearly to zero.
     """
-    if whiten:
-        X = whiten_points(X, whiten_regularization)
-    n = X.shape[0]
-    S = _similarity_graph(X, n_neighbors, n_epochs, chunk_size)
+    n = S.shape[0]
     layout = _graph_layout(S)
 
     max_dist, min_dist = _graph_distance_range(S, layout, chunk_size)
@@ -353,7 +324,24 @@ def density_weights(X, nbd_sample_count_threshold=30, n_neighbors=15, n_epochs=2
     for _ in range(max_iters_weight_count):
         total = total + _radius_counts(S, layout, radius, chunk_size)
         radius = radius - delta
-    density = total / max_iters_weight_count
+    return total / max_iters_weight_count
+
+
+@torch.no_grad()
+def density_weights(X, nbd_sample_count_threshold=30, n_neighbors=15, n_epochs=200, max_iters_weight_count=4,
+                    satisfiability_proportion=0.3, chunk_size=DEFAULT_CHUNK_SIZE, metric="euclidean",
+                    return_graph=False):
+    """Empirical density of every row of ``X``, returned as an (n,) tensor (larger = denser).
+
+    A fuzzy ``n_neighbors``-nearest-neighbour graph of ``X`` (the UMAP fuzzy simplicial set: per-point scale,
+    fuzzy-union symmetrised weights in (0, 1], weak edges dropped) is built, by Euclidean or cosine ``metric``,
+    and its density is computed by ``graph_density``. ``chunk_size`` is the number of rows handled at a time,
+    both by the exact neighbour search that builds the graph and by the graph-space distances; it bounds the
+    memory of the whole computation. With ``return_graph`` the result is ``(density, graph)`` where ``graph`` is
+    that (n, n) coalesced sparse tensor.
+    """
+    S = _similarity_graph(X, n_neighbors, n_epochs, chunk_size, metric)
+    density = graph_density(S, nbd_sample_count_threshold, max_iters_weight_count, satisfiability_proportion, chunk_size)
     return (density, S) if return_graph else density
 
 
@@ -403,12 +391,12 @@ class NeighborScore:
 
     The default selection score. ``a``, ``b`` and ``c`` are the density, stability and distance strengths
     (>= 0; 0 switches that factor off, larger values weight it more). ``d`` is the distance between the point and
-    the candidate in the selection space (Euclidean on the sphere, or Mahalanobis if the selection whitens) and
+    the candidate (Euclidean or cosine, see the ``dist`` of ``forward``) and
     ``h`` the kernel width.
 
     A replacement must have the same call signature and return a score of the same shape as ``dist``, together
     with the memory: ``score(dist, density, stability, h, iteration, n_iters, graph, memory) -> (score, memory)``.
-    The memory is one dict that ``forward`` creates empty before the first iteration and hands to all three
+    The memory is one dict that ``forward`` creates empty before the first iteration and hands to all four
     callables; return it (updated or not) to keep what you stored. The score function is called once per block of
     rows, so the memory passes through every block in turn. ``dist`` is a (chunk, n) block of
     distances from a chunk of points to all points, ``density`` and ``stability`` the (n,) per-candidate vectors,
@@ -438,9 +426,9 @@ class NeighborWeight:
 
     A replacement must have the same call signature and also return the memory,
     ``weight(dist, density, stability, h, iteration, n_iters, graph, memory) -> (weights, memory)`` (the memory is
-    the dict shared by the three callables, see ``NeighborScore``), with the tensors ``dist``, ``density``,
+    the dict shared by the four callables, see ``NeighborScore``), with the tensors ``dist``, ``density``,
     ``stability`` and ``graph`` of shape (n, k) for the k selected neighbours of every point (``dist`` the current
-    distances to them in the selection space, ``stability`` their current scores, ``graph`` the weight of the UMAP
+    distances to them, ``stability`` their current scores, ``graph`` the weight of the UMAP
     fuzzy graph computed for the density between each point and each of its selected neighbours, 0 where the graph
     has no such edge), ``h`` the kernel width in use, ``iteration`` the 0-based index of the iteration whose step
     will use the weights and ``n_iters`` the iteration cap (``max_iters_shift``). It returns non-negative finite (n, k) weights, normalised per row
@@ -457,13 +445,13 @@ class NeighborWeight:
 
 
 @torch.no_grad()
-def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False, whiten_regularization=1e-6,
-                     labels=None, corpus_labels=None, chunk_size=DEFAULT_CHUNK_SIZE, iteration=0, n_iters=1, memory=None):
+def select_neighbors(X, density, stability, k, h, score_fn, graph,
+                     labels=None, corpus_labels=None, chunk_size=DEFAULT_CHUNK_SIZE, iteration=0, n_iters=1, memory=None,
+                     metric="euclidean"):
     """The ``k`` best-scoring other points for every point of ``X``.
 
-    Distances are Euclidean on ``X``, or, with ``whiten``, Euclidean in the whitened space of the current ``X``
-    (Mahalanobis; ``whiten_regularization`` is the ridge of ``whiten_points``). All other points are candidates (no
-    distance pre-filter); a point is never its own neighbour. Candidates with a positive score rank by score,
+    Distances are Euclidean on ``X`` (or cosine, with ``metric="cosine"``). All other points are candidates (no distance pre-filter); a point is never
+    its own neighbour. Candidates with a positive score rank by score,
     the remaining slots (if any) go to the nearest candidates. With ``labels`` a point may only pick points
     whose ``corpus_labels`` equal its label.
 
@@ -471,26 +459,17 @@ def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False,
     ``memory`` dict (an empty one if omitted) are handed on to ``score_fn``, a chunk of rows at a time, the memory
     passing through the chunks in turn.
 
-    Returns ``(indices (n, k), dist (n, k), valid (n, k) bool or None, orphan (n,) bool or None, h, transform,
-    memory)``
+    Returns ``(indices (n, k), dist (n, k), valid (n, k) bool or None, orphan (n,) bool or None, h, memory)``
     where ``valid`` marks picks that respect the label mask, ``orphan`` marks points with no valid pick at all,
-    ``dist`` the distances to the picks in the selection space, ``h`` the kernel width used (``"auto"`` resolves
-    to the median distance to the ``k`` nearest neighbours in that space) and ``transform`` is ``None`` or, with
-    ``whiten``, the ``(mean, W)`` that maps points into the selection space (see ``neighbor_distances``);
-    ``memory`` is the updated dict.
+    ``dist`` the distances to the picks, ``h`` the kernel width used (``"auto"`` resolves to the median distance
+    to the ``k`` nearest neighbours) and ``memory`` is the updated dict.
     """
     n = X.shape[0]
     memory = {} if memory is None else memory
     if isinstance(k, bool) or not isinstance(k, int) or not 1 <= k <= n - 1:
         raise ValueError(f"k={k!r} is invalid for {n} points; expected an integer 1 <= k <= {n - 1}")
-    transform = None
-    if whiten:
-        Z, mean, W = whiten_points(X, whiten_regularization, return_transform=True)
-        transform = (mean, W)
-    else:
-        Z = X
     if h == "auto":
-        h = median_neighbor_distance(Z, k, chunk_size)
+        h = median_neighbor_distance(X, k, chunk_size, metric)
     if labels is not None and corpus_labels is None:
         corpus_labels = labels
 
@@ -500,7 +479,7 @@ def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False,
     valid = torch.empty((n, k), dtype=torch.bool, device=X.device)
     for start in range(0, n, chunk_size):
         end = min(n, start + chunk_size)
-        d = torch.cdist(Z[start:end], Z)                                     # (c, n) distances in the selection space
+        d = pairwise_distance(X[start:end], X, metric)                      # (c, n) distances
         score, memory = _call_with_memory(
             score_fn, (d, density, stability, h, iteration, n_iters, _graph_rows(layout, start, end, n, X.dtype, X.device)),
             memory, "the selection score function")
@@ -521,20 +500,22 @@ def select_neighbors(X, density, stability, k, h, score_fn, graph, whiten=False,
         valid[start:end] = torch.isfinite(top)
 
     if labels is None:
-        return indices, dist, None, None, h, transform, memory
-    return indices, dist, valid, ~valid.any(dim=1), h, transform, memory
+        return indices, dist, None, None, h, memory
+    return indices, dist, valid, ~valid.any(dim=1), h, memory
 
 
 @torch.no_grad()
-def neighbor_distances(X, indices, transform=None, chunk_size=DEFAULT_CHUNK_SIZE):
-    """Current distances (n, k) from every point of ``X`` to its selected neighbours ``indices``, in the selection
-    space: Euclidean on ``X``, or, if the selection whitened, Euclidean after mapping the points with the
-    ``(mean, W)`` transform of that selection."""
-    Z = X if transform is None else (X - transform[0]) @ transform[1]
+def neighbor_distances(X, indices, chunk_size=DEFAULT_CHUNK_SIZE, metric="euclidean"):
+    """Current distances (n, k) from every point of ``X`` to its selected neighbours ``indices``: Euclidean, or
+    cosine with ``metric="cosine"``."""
     out = torch.empty(indices.shape, dtype=X.dtype, device=X.device)
     for start in range(0, X.shape[0], chunk_size):
         end = min(X.shape[0], start + chunk_size)
-        out[start:end] = (Z[start:end].unsqueeze(1) - Z[indices[start:end]]).norm(dim=-1)
+        if metric == "cosine":
+            a, b = X[start:end].unsqueeze(1), X[indices[start:end]]
+            out[start:end] = (1.0 - (a * b).sum(-1) / (a.norm(dim=-1) * b.norm(dim=-1)).clamp_min(1e-12)).clamp_min(0.0)
+        else:
+            out[start:end] = (X[start:end].unsqueeze(1) - X[indices[start:end]]).norm(dim=-1)
     return out
 
 
@@ -622,16 +603,10 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
     learning_rate : fraction of the way a point moves towards its weighted mean each iteration.
     density_strength, stability_strength, distance_strength : the strengths of the default selection score
         and neighbour weight (see ``NeighborScore`` and ``NeighborWeight``); >= 0, 0 switches a factor off.
-    h : kernel width of the distance term, a positive number in the units of the selection space (whitened
-        units if ``whiten_selection``), or "auto" (median distance to the ``k`` nearest neighbours,
+    h : kernel width of the distance term, a positive number, or "auto" (median distance to the ``k`` nearest neighbours,
         re-estimated every time neighbours are selected).
-    whiten_density, whiten_selection : whether the density computation / the neighbour selection measure
-        distances in whitened (Mahalanobis) instead of Euclidean geometry. Both default to False.
-    whiten_regularization : the ridge of the whitening (see ``whiten_points``); only used when one of the two
-        flags is set.
     recompute_neighbors : 0 or None selects neighbours once, from the initial points; a positive N reselects
-        every N iterations (iterations 0, N, 2N, ...), re-estimating the whitening (if on) on the current
-        points and re-evaluating the neighbour weights.
+        every N iterations (iterations 0, N, 2N, ...), re-evaluating the neighbour weights.
     max_iters_shift, shift_threshold : the loop stops when the mean per-point movement on the sphere is below
         ``shift_threshold`` (convergence) or after ``max_iters_shift`` iterations (a safety cap).
     keep_trajectory : also return the unit-norm state after every iteration.
@@ -658,9 +633,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         stability_strength=1.0,
         distance_strength=1.0,
         h="auto",
-        whiten_density=False,
-        whiten_selection=False,
-        whiten_regularization=1e-6,
         recompute_neighbors=0,
         max_iters_shift=1000,
         shift_threshold=1e-4,
@@ -688,10 +660,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             raise ValueError("max_iters_shift must be a positive integer")
         if not shift_threshold >= 0:
             raise ValueError("shift_threshold must be >= 0")
-        if not whiten_regularization >= 0:
-            raise ValueError("whiten_regularization must be >= 0")
-        if not isinstance(whiten_density, bool) or not isinstance(whiten_selection, bool):
-            raise ValueError("whiten_density and whiten_selection must be booleans")
         if label_mode not in LABEL_MODES:
             raise ValueError(f"label_mode must be one of {LABEL_MODES}; got {label_mode!r}")
         if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
@@ -705,9 +673,6 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.satisfiability_proportion = satisfiability_proportion
         self.learning_rate = learning_rate
         self.h = h
-        self.whiten_density = whiten_density
-        self.whiten_selection = whiten_selection
-        self.whiten_regularization = whiten_regularization
         self.recompute_neighbors = recompute_neighbors or 0
         self.max_iters_shift = max_iters_shift
         self.shift_threshold = shift_threshold
@@ -728,7 +693,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         return (labels if self.label_mode == "same_label" else torch.zeros_like(labels)), labels
 
     @torch.no_grad()
-    def forward(self, X, gate=1.0, labels=None, stability_fn=None, score_fn=None, weight_fn=None):
+    def forward(self, X, gate=1.0, labels=None, stability_fn=None, score_fn=None, weight_fn=None, density_fn=None,
+                dist="euclidean"):
         """Run MSDE on the rows of ``X`` and return ``(shifted, total_distance, trajectory)``.
 
         shifted : (n, d) unit-norm points after the last iteration.
@@ -752,7 +718,20 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             selection. Without a ``stability_fn`` the scores stay at 1.0. The final scores are available as
             ``stability_`` afterwards.
 
-        All three callables receive one dict, ``memory``, after their regular arguments and return it (updated)
+        density_fn : optional replacement for the density. Without one the density is computed once, from the
+            initial points (``graph_density``). With one it is called at the start of **every** iteration, before
+            the neighbours are selected, as ``density_fn(x, density, stability, iteration, n_iters, graph, memory)``
+            with ``x`` the (n, d) unit-norm points as they are now, ``density`` the (n,) density before this update
+            (all 1.0 at the first iteration), ``stability`` the current scores and ``graph`` the (n, n) coalesced
+            sparse UMAP fuzzy graph of the initial points (built with ``dist``; it is not rebuilt). It returns
+            ``(density, memory)``, the density being (n,), finite and non-negative (larger = denser). The neighbour
+            weights are then re-evaluated every iteration, as with a ``weight_fn``. The final density is available
+            as ``density_`` afterwards.
+        dist : the distance of the whole run, ``"euclidean"`` or ``"cosine"`` (``1 - cos``): it builds the fuzzy
+            graph, selects the neighbours, sets ``h="auto"`` and is the distance handed to ``score_fn`` and
+            ``weight_fn``. The points always stay on the unit sphere.
+
+        All four callables receive one dict, ``memory``, after their regular arguments and return it (updated)
         after their result, as ``(result, memory)``. ``forward`` creates it empty before the first iteration, so a
         new call starts with no memory; every callable reads and writes the same dict. It is available as
         ``memory_`` after the run.
@@ -763,7 +742,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         weight_fn : optional replacement for the neighbour weights of the weighted mean (see ``NeighborWeight``;
             it carries its own parameters and receives ``iteration`` and ``n_iters``). A function you pass is
             evaluated at the start of **every** iteration, with the current distances to the selected neighbours
-            (in the selection space) and the current stability scores, so the weights follow the moving points
+            and the current stability scores, so the weights follow the moving points
             and the stability updates. The default is used when not given; it only depends on the density and
             the stability, so it is re-evaluated only when a ``stability_fn`` is given.
         """
@@ -772,43 +751,51 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             raise ValueError(f"X must be a 2D floating-point tensor; got shape {tuple(X.shape)}, dtype {X.dtype}")
         X = X.detach().to(self.device_name)
         n = X.shape[0]
+        if dist not in METRICS:
+            raise ValueError(f"dist must be one of {METRICS}; got {dist!r}")
         if not 1 <= self.k <= n - 1 or not 1 <= self.n_neighbors <= n:
             raise ValueError(f"k={self.k} and n_neighbors={self.n_neighbors} need k <= n-1 and n_neighbors <= n "
                              f"for n={n} points")
 
         stability = torch.ones(n, dtype=X.dtype, device=X.device)           # every point starts fully stable
-        memory = {}                                                          # shared by the three callables: empty at the start
+        memory = {}                                                          # shared by the four callables: empty at the start
         query_labels, neighbor_labels = self._labels(labels, n)
         score_fn = score_fn if score_fn is not None else self.default_score
-        weights_every_iteration = weight_fn is not None or stability_fn is not None
+        weights_every_iteration = weight_fn is not None or stability_fn is not None or density_fn is not None
         weight_fn = weight_fn if weight_fn is not None else self.default_weight
         n_iters = self.max_iters_shift
 
         x = unit(X)                                                          # on the sphere from the start
-        density, graph = density_weights(
-            x, self.nbd_sample_count_threshold, self.n_neighbors, self.n_epochs, self.max_iters_weight_count,
-            self.satisfiability_proportion, self.chunk_size,
-            whiten=self.whiten_density, whiten_regularization=self.whiten_regularization, return_graph=True,
-        )
-        density = density.clamp_min(0.0).to(x.dtype)
+        graph = _similarity_graph(x, self.n_neighbors, self.n_epochs, self.chunk_size, dist)
+        if density_fn is None:
+            density = graph_density(graph, self.nbd_sample_count_threshold, self.max_iters_weight_count,
+                                    self.satisfiability_proportion, self.chunk_size).clamp_min(0.0).to(x.dtype)
+        else:
+            density = torch.ones(n, dtype=x.dtype, device=x.device)         # replaced at the start of every iteration
 
         total_distance = torch.zeros(n, dtype=x.dtype, device=x.device)
         trajectory = [x.clone()] if self.keep_trajectory else []
-        state, indices, dist, valid, orphan, h, transform, graph_pairs = None, None, None, None, None, None, None, None
+        state, indices, nbr_dist, valid, orphan, h, graph_pairs = None, None, None, None, None, None, None
         for iteration in range(n_iters):
+            if density_fn is not None:
+                density, memory = _call_with_memory(
+                    density_fn, (x, density, stability, iteration, n_iters, graph), memory, "the density function")
+                if density.shape != (n,) or not bool(torch.isfinite(density).all()) or bool((density < 0).any()):
+                    raise ValueError(f"the density must be a finite non-negative tensor of shape ({n},); "
+                                     f"got shape {tuple(density.shape)}")
+                density = density.to(x.dtype)
             selected = iteration == 0 or bool(self.recompute_neighbors and iteration % self.recompute_neighbors == 0)
             if selected:
-                indices, dist, valid, orphan, h, transform, memory = select_neighbors(
+                indices, nbr_dist, valid, orphan, h, memory = select_neighbors(
                     x, density, stability, self.k, self.h, score_fn, graph,
-                    whiten=self.whiten_selection, whiten_regularization=self.whiten_regularization,
                     labels=query_labels, corpus_labels=neighbor_labels, chunk_size=self.chunk_size,
-                    iteration=iteration, n_iters=n_iters, memory=memory,
+                    iteration=iteration, n_iters=n_iters, memory=memory, metric=dist,
                 )
                 graph_pairs = graph_values_at(graph, indices).to(x.dtype)     # fuzzy-graph weight of every selected pair
             elif weights_every_iteration:
-                dist = neighbor_distances(x, indices, transform, self.chunk_size)   # distances at the current positions
+                nbr_dist = neighbor_distances(x, indices, self.chunk_size, dist)   # distances at the current positions
             if selected or weights_every_iteration:
-                state = prepare_step(indices, dist, density, stability, h, weight_fn, valid, n, iteration, n_iters, graph_pairs, memory)
+                state = prepare_step(indices, nbr_dist, density, stability, h, weight_fn, valid, n, iteration, n_iters, graph_pairs, memory)
                 memory = state[3]
 
             mean = weighted_mean(x, *state[:3], chunk_size=self.chunk_size)
@@ -830,6 +817,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                 logger.info("converged after %d iterations", iteration + 1)
                 break
 
+        self.density_ = density                                              # the final density
         self.stability_ = stability                                          # the final scores (1.0 without a stability_fn)
         self.memory_ = memory                                                # the shared memory after the run
         return x, total_distance, trajectory
