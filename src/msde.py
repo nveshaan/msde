@@ -4,7 +4,9 @@ Every point of an embedding set is repeatedly moved towards a weighted mean of i
 movement converges. The pipeline, in the order ``MeanShiftDensityEnhancement.forward`` runs it:
 
 1. **Normalise** the embeddings to unit length. They are re-normalised right after every shift, so every
-   state the loop passes through (and the output) lies on the sphere.
+   state the loop passes through (and the output) lies on the sphere. Optionally (``spherical_centering``) the
+   points are first centred on their Fréchet mean: each is mapped to the tangent space there (log map), which
+   removes the shared mean direction, and put back on the sphere.
 2. **Density**: an empirical density per point, computed once on the initial points (or, with a ``density_fn``, at every iteration). A fuzzy k-nearest-neighbour graph is built; points are then compared as rows of that
    sparse graph (sparse matmul), and a point's density is the average number of other points within a
    radius, over a few shrinking radii.
@@ -103,6 +105,37 @@ def _knn_kernel(k, metric):
             return pairwise_distance(X_chunk, X_full, metric).topk(k, largest=False, dim=1)   # (chunk, n): all-pairs
         _KNN_KERNELS[(k, metric)] = torch.compile(_kernel, fullgraph=True)
     return _KNN_KERNELS[(k, metric)]
+
+
+@torch.no_grad()
+def frechet_mean(X, max_iters=100, tol=1e-7):
+    """Fréchet (Karcher) mean of unit-norm rows on the sphere: start from the normalised Euclidean mean and
+    repeat ``mu <- Exp_mu(mean of Log_mu(x_i))`` until the update is shorter than ``tol``."""
+    mu = unit(X.mean(0, keepdim=True))
+    for _ in range(max_iters):
+        g = _log_map(mu, X).mean(0, keepdim=True)
+        size = g.norm()
+        if size < tol:
+            break
+        mu = unit(mu * torch.cos(size) + g / size * torch.sin(size))
+    return mu
+
+
+def _log_map(mu, X):
+    """Log map at the unit vector ``mu`` (1, d) of unit-norm rows ``X``: the tangent vector, of length equal to
+    the angle between ``mu`` and the row, pointing away from ``mu`` towards it (zero for a row equal to ``mu``)."""
+    cos = X @ mu.T
+    v = X - cos * mu
+    vnorm = v.norm(dim=1, keepdim=True)
+    return v * (torch.atan2(vnorm, cos) / vnorm.clamp_min(1e-12))
+
+
+@torch.no_grad()
+def spherical_center(X):
+    """Centre unit-norm rows on their Fréchet mean: ``Log_mu(x) / ||Log_mu(x)||``. Every returned row is
+    orthogonal to the mean. Returns ``(centered, mu (d,))``."""
+    mu = frechet_mean(X)
+    return unit(_log_map(mu, X)), mu[0]
 
 
 @torch.no_grad()
@@ -609,6 +642,9 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         every N iterations (iterations 0, N, 2N, ...), re-evaluating the neighbour weights.
     max_iters_shift, shift_threshold : the loop stops when the mean per-point movement on the sphere is below
         ``shift_threshold`` (convergence) or after ``max_iters_shift`` iterations (a safety cap).
+    spherical_centering : centre the points on their Fréchet mean before the first iteration (see
+        ``spherical_center``); everything after it, including the output and the trajectory's first state, is in
+        the centred space. The mean is available as ``center_`` afterwards (``None`` if off).
     keep_trajectory : also return the unit-norm state after every iteration.
     label_mode : how ``labels`` given to ``forward`` restrict neighbours: "same_label" (a point's neighbours
         must share its label) or "zero_label" (neighbours must have label 0, whatever the point's own label).
@@ -636,6 +672,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         recompute_neighbors=0,
         max_iters_shift=1000,
         shift_threshold=1e-4,
+        spherical_centering=False,
         keep_trajectory=False,
         label_mode="same_label",
         chunk_size=DEFAULT_CHUNK_SIZE,
@@ -660,6 +697,8 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             raise ValueError("max_iters_shift must be a positive integer")
         if not shift_threshold >= 0:
             raise ValueError("shift_threshold must be >= 0")
+        if not isinstance(spherical_centering, bool):
+            raise ValueError("spherical_centering must be a boolean")
         if label_mode not in LABEL_MODES:
             raise ValueError(f"label_mode must be one of {LABEL_MODES}; got {label_mode!r}")
         if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
@@ -676,6 +715,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.recompute_neighbors = recompute_neighbors or 0
         self.max_iters_shift = max_iters_shift
         self.shift_threshold = shift_threshold
+        self.spherical_centering = spherical_centering
         self.keep_trajectory = keep_trajectory
         self.label_mode = label_mode
         self.chunk_size = chunk_size
@@ -766,6 +806,9 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         n_iters = self.max_iters_shift
 
         x = unit(X)                                                          # on the sphere from the start
+        self.center_ = None
+        if self.spherical_centering:
+            x, self.center_ = spherical_center(x)                            # Fréchet-mean centred, still on the sphere
         graph = _similarity_graph(x, self.n_neighbors, self.n_epochs, self.chunk_size, dist)
         if density_fn is None:
             density = graph_density(graph, self.nbd_sample_count_threshold, self.max_iters_weight_count,

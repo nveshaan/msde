@@ -16,7 +16,7 @@ from msde import MeanShiftDensityEnhancement
 shifted, movement, trajectory = MeanShiftDensityEnhancement(k=50)(X)
 ```
 
-See `DOC.md` for the pipeline, every option, how to replace the selection score and the neighbour weights, and speed notes.
+See `DOC.md` for the pipeline, every option, how to replace the density, the selection score, the neighbour weights and the stability update, and speed notes.
 A modular version, with swappable neighbour, weight, step and loop components and YAML experiment configs, lives on the `modular` branch.
 
 ## Acknowledgements
