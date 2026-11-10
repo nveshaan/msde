@@ -27,7 +27,7 @@ shifted, movement, trajectory = model(X)
 3. **Select neighbours.** In the geometry chosen by `dist` (Euclidean or cosine) of the current points on the sphere, every other point is scored by `NeighborScore` and the `k` best are kept: with the default score `density^a * stability^b * exp(-c * d^2 / (2 h^2))`, so a dense, stable point can outrank a closer, sparse one. All points are candidates (no distance pre-filter) and a point is never its own neighbour. Candidates with a positive score rank by score; if fewer than `k` have one, the remaining slots go to the nearest candidates.
 4. **Weights.** Each selected neighbour gets a weight from `NeighborWeight` (default `density^a * stability^b`); weights of picks that violate the label mask are zeroed and rows are normalised to sum to 1. The default weights are computed when neighbours are selected, and again at the start of every iteration if a `stability_fn` or a `density_fn` is given (the weights depend on both); a `weight_fn` you pass is evaluated at the start of every iteration, with the current distances to the selected neighbours.
 5. **Step.** `mean = W @ X` with `W` a sparse `(n, n)` matrix holding the `n*k` normalised weights (one sparse matmul), then `x' = normalise(x + learning_rate * gate * (mean - x))`.
-6. **Repeat** until the mean per-point movement on the sphere falls below `shift_threshold` (convergence) or `max_iters_shift` iterations have run. With `recompute_neighbors = N > 0`, stage 3 (the neighbour selection) is redone every `N` iterations on the current points (iterations 0, N, 2N, ...); the default density is never recomputed. A `density_fn`, a `weight_fn` and a `stability_fn`, if given, run in every iteration regardless of `recompute_neighbors`. Within an iteration the order is: density update (`density_fn`) → select neighbours (if due) → weights → step → stability update (`stability_fn`).
+6. **Repeat** until the mean per-point movement on the sphere falls below `shift_threshold` (convergence) or `max_iters_shift` iterations have run. With `recompute_neighbors = N > 0`, stage 3 (the neighbour selection) is redone every `N` iterations on the current points (iterations 0, N, 2N, ...); the default density is never recomputed. A `density_fn`, a `weight_fn`, a `stability_fn` and a `metric_fn`, if given, run in every iteration regardless of `recompute_neighbors`. Within an iteration the order is: density update (`density_fn`) → select neighbours (if due) → weights → step → stability update (`stability_fn`) → metric update (`metric_fn`).
 
 ## Constructor
 
@@ -55,22 +55,23 @@ shifted, movement, trajectory = model(X)
 
 A strength is a number `>= 0`; 0 switches that factor off and larger values weight it more (they are exponents on density and stability, and a multiplier on the squared distance in the kernel).
 
-## `forward(X, gate=1.0, labels=None, stability_fn=None, score_fn=None, weight_fn=None, density_fn=None, dist="euclidean")`
+## `forward(X, gate=1.0, labels=None, stability_fn=None, metric_fn=None, score_fn=None, weight_fn=None, density_fn=None, dist="euclidean")`
 
 | Argument | Meaning |
 | --- | --- |
 | `X` | `(n, d)` floating-point embeddings. |
 | `gate` | Multiplier on the step size for this call (0 leaves the points where they are). |
 | `labels` | `(n,)` integer labels restricting neighbour selection (see `label_mode`). A point with no valid neighbour is left where it is. |
-| `stability_fn` | Optional callable that updates the stability scores (`(n,)`, in `[0, 1]`, higher = more stable) after every iteration from that iteration's step vectors. Without one, every point stays at 1.0. See [Stability](#stability). |
+| `stability_fn` | Optional callable that updates the stability scores (`(n,)`, in `[0, 1]`, higher = more stable) after every iteration. It receives the new and previous positions. Without one, every point stays at 1.0. See [Stability](#stability). |
+| `metric_fn` | Optional callable evaluated after every iteration. Its per-iteration values are summed and returned in place of the default `(n,)` summed chord movement. |
 | `score_fn` | Replacement for the selection score. Called whenever neighbours are selected, including the initial selection, so with `recompute_neighbors=0` it defines the single neighbour graph the run uses. |
 | `weight_fn` | Replacement for the neighbour weights of the weighted mean. Evaluated at the start of **every** iteration, with the current distances and stability scores. The default is used when it is not given. |
 | `density_fn` | Replacement for the density. Called at the start of **every** iteration, before the neighbours are selected. Without one the density is computed once, from the initial points. The final density is available as `model.density_`. |
 | `dist` | `"euclidean"` (default) or `"cosine"` (`1 - cos`; on the unit sphere this is half the squared Euclidean distance, so it orders pairs the same way but on a different scale, which matters for `h` and the distance term). It sets the distance of the whole run: the k-NN that builds the fuzzy graph, the neighbour selection, `h="auto"`, and the `dist` that `score_fn` and `weight_fn` receive. The points always stay on the unit sphere. Any other value raises a `ValueError`. |
 
-### Replacing the density, the selection score, the neighbour weights and the stability update
+### Replacing the density, selection score, neighbour weights, stability update and returned metric
 
-All four are plain callables that carry their own parameters. Besides the arguments below, all of them receive and return the **shared memory dict** (next section), and all of them receive the **0-based index of the current iteration** and the **iteration cap** `n_iters` (`max_iters_shift`; a run may stop earlier by convergence), so they can change over the run, and the **UMAP fuzzy graph** that was computed for the initial points (below). The defaults are `graph_density` for the density and the callable classes `NeighborScore(distance_strength, density_strength, stability_strength)` and `NeighborWeight(density_strength, stability_strength)`; the default stability is 1.0 for every point.
+These are plain callables that carry their own parameters. Besides the arguments below, all of them receive and return the **shared memory dict** (next section), and all of them receive the **0-based index of the current iteration** and the **iteration cap** `n_iters` (`max_iters_shift`; a run may stop earlier by convergence), so they can change over the run, and the **UMAP fuzzy graph** that was computed for the initial points (below). The defaults are `graph_density` for the density and the callable classes `NeighborScore(distance_strength, density_strength, stability_strength)` and `NeighborWeight(density_strength, stability_strength)`; the default stability is 1.0 for every point.
 
 ```python
 density_fn(x, density, stability, iteration, n_iters, graph, memory)
@@ -93,14 +94,18 @@ weight_fn(dist, density, stability, h, iteration, n_iters, graph, memory)
     #  graph = fuzzy-graph weight between each point and each selected neighbour, 0 if there is no such edge)
     # weights: (n, k), finite and >= 0; normalised per row afterwards
 
-stability_fn(step, density, stability, h, iteration, n_iters, graph, memory)
+stability_fn(moved, x, density, stability, h, iteration, n_iters, graph, memory)
         -> (stability, memory)
-    # step: (n, d) displacement of every point in the iteration that just finished; density, stability: (n,)
-    # graph: the full (n, n) sparse fuzzy graph
-    # stability: (n,) scores in [0, 1]
+    # moved and x: (n, d) positions after and before this iteration; density, stability: (n,)
+    # graph: the full (n, n) sparse fuzzy graph; stability: (n,) scores in [0, 1]
+
+metric_fn(moved, x, density, stability, h, iteration, n_iters, graph, memory)
+        -> (metric, memory)
+    # moved and x: (n, d) positions after and before this iteration; other arguments match stability_fn
+    # metric values are summed over iterations and become the second item returned by forward
 ```
 
-**Memory.** At the start of `forward`, before the first iteration, one empty dict is created. **Every** function receives it after its regular arguments and returns it, updated, after its result as `(result, memory)`; the returned dict is what the next call (of any of the four functions) receives. It is a plain dict, so the functions can keep running statistics, counters or caches in it, and read what another function wrote (use distinct keys; nothing enforces ownership). A new `forward` call starts with an empty dict again; the final one is available as `model.memory_`. `score_fn` is called once per block of `chunk_size` rows, so the memory passes through the blocks in turn within a selection. A function that returns anything other than a 2-tuple whose second entry is a dict raises a `ValueError`; the default `NeighborScore` and `NeighborWeight` pass the memory through untouched.
+**Memory.** At the start of `forward`, before the first iteration, one empty dict is created. **Every** function receives it after its regular arguments and returns it, updated, after its result as `(result, memory)`; the returned dict is what the next call (of any of the five functions) receives. It is a plain dict, so the functions can keep running statistics, counters or caches in it, and read what another function wrote (use distinct keys; nothing enforces ownership). A new `forward` call starts with an empty dict again; the final one is available as `model.memory_`. `score_fn` is called once per block of `chunk_size` rows, so the memory passes through the blocks in turn within a selection. A function that returns anything other than a 2-tuple whose second entry is a dict raises a `ValueError`; the default `NeighborScore` and `NeighborWeight` pass the memory through untouched.
 
 | function | called | `iteration` is |
 | --- | --- | --- |
@@ -108,10 +113,11 @@ stability_fn(step, density, stability, h, iteration, n_iters, graph, memory)
 | `score_fn` | whenever neighbours are selected: at the start, and every `recompute_neighbors` iterations after | the iteration whose step will use the selected neighbours |
 | `weight_fn` | at the start of every iteration, after any selection | the iteration whose step will use the weights |
 | `stability_fn` | after every iteration | the iteration that just finished |
+| `metric_fn` | after every iteration | the iteration that just finished |
 
-**The fuzzy graph.** The density is computed from a UMAP-style fuzzy `n_neighbors`-nearest-neighbour graph of the initial points: every point has a per-point scale, an edge to each of its `n_neighbors` nearest points, the two directions of a pair are combined by fuzzy union, and edges weaker than `max / n_epochs` are dropped. Weights are in `(0, 1]`. There is one entry per directed nearest-neighbour edge (about `n_neighbors` per point), so the matrix is **not** symmetric: on 3,240 ARMD OCT embeddings (CLIP) about 58% of the edges also exist in the reverse direction. It is computed **once**, before the first iteration, and is the same for the whole run. Each function gets the view that fits its other arguments: the `(chunk, n)` dense rows aligned with `dist` for `score_fn` (0 where there is no edge), the `(n, k)` values for the selected `(point, neighbour)` pairs for `weight_fn` (0 where a selected neighbour is not a graph neighbour; this differs from the graph neighbours because selection also looks at density), and the whole `(n, n)` coalesced sparse tensor for `density_fn` and `stability_fn`.
+**The fuzzy graph.** The density is computed from a UMAP-style fuzzy `n_neighbors`-nearest-neighbour graph of the initial points: every point has a per-point scale, an edge to each of its `n_neighbors` nearest points, the two directions of a pair are combined by fuzzy union, and edges weaker than `max / n_epochs` are dropped. Weights are in `(0, 1]`. There is one entry per directed nearest-neighbour edge (about `n_neighbors` per point), so the matrix is **not** symmetric: on 3,240 ARMD OCT embeddings (CLIP) about 58% of the edges also exist in the reverse direction. It is computed **once**, before the first iteration, and is the same for the whole run. Each function gets the view that fits its other arguments: the `(chunk, n)` dense rows aligned with `dist` for `score_fn` (0 where there is no edge), the `(n, k)` values for the selected `(point, neighbour)` pairs for `weight_fn` (0 where a selected neighbour is not a graph neighbour; this differs from the graph neighbours because selection also looks at density), and the whole `(n, n)` coalesced sparse tensor for `density_fn`, `stability_fn` and `metric_fn`.
 
-Within an iteration the order is: density update → select neighbours (if due) → weights → step → stability update. A function with an older signature (without `iteration`, `n_iters`, `graph` or the memory) raises a `TypeError`. `dist` is the distance chosen by the `dist` argument of `forward`; for `weight_fn` it is recomputed from the current positions every iteration. Shape or value violations raise `ValueError`. Examples:
+Within an iteration the order is: density update → select neighbours (if due) → weights → step → stability update → metric update. A function with an older signature (without `iteration`, `n_iters`, `graph` or the memory) raises a `TypeError`. `dist` is the distance chosen by the `dist` argument of `forward`; for `weight_fn` it is recomputed from the current positions every iteration. Shape or value violations raise `ValueError`. Examples:
 
 ```python
 from msde import MeanShiftDensityEnhancement, NeighborScore, NeighborWeight
@@ -150,11 +156,12 @@ def live_density(x, density, stability, iteration, n_iters, graph, memory, radiu
     return (torch.cdist(x, x) < radius).sum(dim=1).float() - 1, memory
 shifted, _, _ = model(X, density_fn=live_density)
 
-# a stability that compares a point's step with the average step of its graph neighbours (a sparse matmul)
-def moves_like_neighbours(step, density, stability, h, iteration, n_iters, graph, memory):
-    weight_sum = torch.sparse.mm(graph, torch.ones(step.shape[0], 1, device=step.device)).clamp_min(1e-9)
-    local = torch.sparse.mm(graph, step) / weight_sum
-    scores = torch.exp(-(step - local).norm(dim=1) / step.norm(dim=1).median().clamp_min(1e-9))
+# a stability that compares a point's displacement with the average displacement of its graph neighbours
+def moves_like_neighbours(moved, x, density, stability, h, iteration, n_iters, graph, memory):
+    displacement = moved - x
+    weight_sum = torch.sparse.mm(graph, torch.ones(x.shape[0], 1, device=x.device)).clamp_min(1e-9)
+    local = torch.sparse.mm(graph, displacement) / weight_sum
+    scores = torch.exp(-(displacement - local).norm(dim=1) / displacement.norm(dim=1).median().clamp_min(1e-9))
     return scores, memory
 shifted, _, _ = model(X, stability_fn=moves_like_neighbours)
 ```
@@ -163,27 +170,27 @@ With `recompute_neighbors=0` the neighbour graph is fixed after the first select
 
 ### Stability
 
-Every point starts with stability 1.0. A `stability_fn` (a callable that carries its own parameters) updates the scores **after every iteration** from what the points just did; its signature is given above. `step` is the displacement each point made in the iteration that just finished (new unit position minus old; zero for a point left in place), `stability` the scores before this update (all 1.0 at the start), so running updates are possible.
+Every point starts with stability 1.0. A `stability_fn` (a callable that carries its own parameters) updates the scores **after every iteration** from what the points just did; its signature is given above. `moved` and `x` are the new and previous unit positions, and `stability` contains the scores before this update (all 1.0 at the start), so running updates are possible.
 
 - **Timing.** The first neighbour selection and the first step use scores of 1.0, since there is no step yet. After that the updated scores feed the neighbour weights of the next iteration (re-evaluated every iteration) and, whenever neighbours are reselected (`recompute_neighbors > 0`), the selection score. With `recompute_neighbors=0` the neighbour graph itself is fixed by the initial scores, but the weights on it still follow the stability.
 - **Result.** The final scores are available afterwards as `model.stability_` (all 1.0 without a `stability_fn`).
-- **A fixed set of scores** can be supplied with a closure, `stability_fn=lambda step, density, stability, h, iteration, n_iters, graph, memory: (my_scores, memory)`; they take effect from the second iteration on.
+- **A fixed set of scores** can be supplied with a closure, `stability_fn=lambda moved, x, density, stability, h, iteration, n_iters, graph, memory: (my_scores, memory)`; they take effect from the second iteration on.
 - **Cost.** Per iteration a `stability_fn` adds one call, and the weights are rebuilt (live distances `O(n k d)`, and the sparse weight matrix `O(n k log(n k))`). A `weight_fn` or a `density_fn` costs the same without the stability call (plus the work of the function itself). Nothing is added when none of them is given, and the results are then identical to a run without these features.
 
 ```python
 import torch
 
-def movers_unstable(step, density, stability, h, iteration, n_iters, graph, memory):
+def movers_unstable(moved, x, density, stability, h, iteration, n_iters, graph, memory):
     # a point that moves much more than the typical point in an iteration is unstable
-    size = step.norm(dim=1)
+    size = (moved - x).norm(dim=1)
     return torch.exp(-size / size.median().clamp_min(1e-9)), memory
 
 class RunningStability:
     # an exponential moving average of the same score, with its own parameter
     def __init__(self, momentum=0.5):
         self.momentum = momentum
-    def __call__(self, step, density, stability, h, iteration, n_iters, graph, memory):
-        size = step.norm(dim=1)
+    def __call__(self, moved, x, density, stability, h, iteration, n_iters, graph, memory):
+        size = (moved - x).norm(dim=1)
         target = torch.exp(-size / size.median().clamp_min(1e-9))
         memory["median_step"] = memory.get("median_step", []) + [float(size.median())]   # the memory keeps a history
         return (1 - self.momentum) * stability + self.momentum * target, memory

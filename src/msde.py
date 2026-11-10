@@ -19,12 +19,12 @@ movement converges. The pipeline, in the order ``MeanShiftDensityEnhancement.for
    per-point movement on the sphere drops below ``shift_threshold`` or ``max_iters_shift`` is reached.
 
 Stability scores (values in [0, 1], higher = more stable) start at 1.0 for every point. Pass a ``stability_fn`` to
-``forward`` and they are updated after every iteration from that iteration's step vectors; the updated scores feed
+``forward`` and they are updated after every iteration from the previous and moved positions; the updated scores feed
 the next neighbour weights and, whenever neighbours are reselected, the selection score. The density, the selection score, the
 neighbour weights and the stability update can each be replaced by a callable (which carries its own parameters)
 passed to ``forward``; all of them receive the index of the current iteration and the iteration cap, so they can
 change over the run, and the UMAP fuzzy graph that was built for the density. ``forward`` also creates one empty
-dict before the first iteration; all four callables receive it and return it (updated) with their result, so they
+dict before the first iteration; all five callables receive it and return it (updated) with their result, so they
 can remember things across calls and share them.
 
 Only torch is required.
@@ -603,17 +603,16 @@ def weighted_mean(X, indices, w, W, chunk_size=DEFAULT_CHUNK_SIZE):
 # Stability update
 # ---------------------------------------------------------------------------------------------------------
 @torch.no_grad()
-def update_stability(stability_fn, step, density, stability, h, iteration, n_iters, graph, memory):
-    """New (n,) stability scores from the latest step vectors, and the updated shared ``memory`` dict, as
-    ``(scores, memory)``.
+def update_stability(stability_fn, moved, x, density, stability, h, iteration, n_iters, graph, memory):
+    """New (n,) stability scores and the updated shared ``memory`` dict, as ``(scores, memory)``.
 
-    ``stability_fn(step, density, stability, h, iteration, n_iters, graph, memory)`` returns ``(scores, memory)`` and gets the (n, d) displacement each point
-    made in the iteration that just finished, the (n,) density, the (n,) scores before this update, the kernel
-    width ``h``, the 0-based index of that iteration, the iteration cap and the full (n, n) sparse UMAP fuzzy
-    graph computed for the density, and must return finite (n,) scores within [0, 1].
+    ``stability_fn(moved, x, density, stability, h, iteration, n_iters, graph, memory)`` receives the new and
+    previous (n, d) positions, the (n,) density, the (n,) scores before this update, the kernel width ``h``, the
+    0-based iteration index, the iteration cap and the full (n, n) sparse UMAP fuzzy graph. It must return finite
+    (n,) scores within [0, 1].
     """
     new, memory = _call_with_memory(
-        stability_fn, (step, density, stability, h, iteration, n_iters, graph), memory, "the stability function")
+        stability_fn, (moved, x, density, stability, h, iteration, n_iters, graph), memory, "the stability function")
     if not isinstance(new, torch.Tensor) or new.shape != stability.shape:
         raise ValueError(f"the stability scores must be a tensor of shape {tuple(stability.shape)}; "
                          f"got {tuple(getattr(new, 'shape', ()))}")
@@ -733,58 +732,55 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         return (labels if self.label_mode == "same_label" else torch.zeros_like(labels)), labels
 
     @torch.no_grad()
-    def forward(self, X, gate=1.0, labels=None, stability_fn=None, score_fn=None, weight_fn=None, density_fn=None,
-                dist="euclidean"):
-        """Run MSDE on the rows of ``X`` and return ``(shifted, total_distance, trajectory)``.
+    def forward(self, X, gate=1.0, labels=None, stability_fn=None, metric_fn=None, score_fn=None, weight_fn=None,
+                density_fn=None, dist="euclidean"):
+        """Run MSDE and return ``(shifted, metric, trajectory)``.
 
-        shifted : (n, d) unit-norm points after the last iteration.
-        total_distance : (n,) the distance each point moved, summed over iterations (chords on the sphere).
-        trajectory : list of unit-norm (n, d) states (initial state, then after each iteration) if
-            ``keep_trajectory`` is set, otherwise empty.
+        Parameters
+        ----------
+        X : (n, d) floating-point tensor
+            Input embeddings; rows are normalised onto the unit sphere.
+        gate : float
+            Multiplier on the step size for this call.
+        labels : optional (n,) integer array
+            Restricts neighbour selection according to ``label_mode``. Points with no valid neighbour stay in place.
+        stability_fn : optional callable
+            Updates the (n,) stability scores after each iteration. It is called as
+            ``stability_fn(moved, x, density, stability, h, iteration, n_iters, graph, memory)``. ``moved`` and
+            ``x`` are the new and previous (n, d) unit-norm positions; ``stability`` contains the scores before
+            this update. Return ``(scores, memory)`` where scores are finite and in [0, 1]. Scores start at 1.0;
+            updated scores affect the next iteration's weights and later neighbour selections. The final scores
+            are available as ``stability_``.
+        metric_fn : optional callable
+            Computes a custom metric after each iteration. It receives the same arguments as ``stability_fn`` and
+            returns ``(metric, memory)``. The value from the last completed iteration is returned as the second
+            item instead of the default summed per-point movement.
+        score_fn : optional callable
+            Replaces the selection score (see ``NeighborScore``). It is called at every neighbour selection,
+            including the initial one.
+        weight_fn : optional callable
+            Replaces the weights used for the weighted mean (see ``NeighborWeight``). A supplied function is
+            evaluated at the start of every iteration using current neighbour distances and stability scores.
+        density_fn : optional callable
+            Replaces the density. It is called at the start of every iteration, before neighbour selection.
+            Without one, density is computed once from the initial points. The final density is ``density_``.
+        dist : {``"euclidean"``, ``"cosine"``}
+            Distance used for the fuzzy graph, neighbour selection, ``h="auto"``, and ``score_fn``/``weight_fn``.
+            The points always stay on the unit sphere.
 
-        gate : multiplier on the step size for this call.
-        labels : optional (n,) integer labels restricting neighbour selection (see ``label_mode``). A point
-            with no valid neighbour is left where it is.
-        stability_fn : optional callable that updates the stability scores (higher = more stable, in [0, 1]) after
-            every iteration; it carries its own parameters. Called as
-            ``stability_fn(step, density, stability, h, iteration, n_iters, graph, memory)`` with ``step`` the (n, d) displacement
-            every point made in the iteration that just finished (new unit position minus old; zero for a point
-            left in place), ``density`` the (n,) density, ``stability`` the (n,) scores before this update (all 1.0
-            at the start), ``h`` the kernel width in use, ``iteration`` the 0-based index of that iteration and
-            ``n_iters`` the iteration cap (``max_iters_shift``) and ``graph`` the full (n, n) sparse UMAP fuzzy graph
-            computed for the density; it returns ``(scores, memory)``, the
-            scores being (n,), finite and within [0, 1]. The first selection and the first step always use scores of 1.0 (there is no step yet). The
-            updated scores are used by the next iteration's neighbour weights and by every later neighbour
-            selection. Without a ``stability_fn`` the scores stay at 1.0. The final scores are available as
-            ``stability_`` afterwards.
+        Returns
+        -------
+        shifted : (n, d) tensor
+            Unit-norm points after the last iteration.
+        metric :
+            With ``metric_fn``, the sum of its per-iteration metric values; otherwise the (n,) sum of each point's
+            per-iteration chord lengths on the sphere.
+        trajectory : list of (n, d) tensors
+            Initial state followed by each iteration's state when ``keep_trajectory=True``; otherwise empty.
 
-        density_fn : optional replacement for the density. Without one the density is computed once, from the
-            initial points (``graph_density``). With one it is called at the start of **every** iteration, before
-            the neighbours are selected, as ``density_fn(x, density, stability, iteration, n_iters, graph, memory)``
-            with ``x`` the (n, d) unit-norm points as they are now, ``density`` the (n,) density before this update
-            (all 1.0 at the first iteration), ``stability`` the current scores and ``graph`` the (n, n) coalesced
-            sparse UMAP fuzzy graph of the initial points (built with ``dist``; it is not rebuilt). It returns
-            ``(density, memory)``, the density being (n,), finite and non-negative (larger = denser). The neighbour
-            weights are then re-evaluated every iteration, as with a ``weight_fn``. The final density is available
-            as ``density_`` afterwards.
-        dist : the distance of the whole run, ``"euclidean"`` or ``"cosine"`` (``1 - cos``): it builds the fuzzy
-            graph, selects the neighbours, sets ``h="auto"`` and is the distance handed to ``score_fn`` and
-            ``weight_fn``. The points always stay on the unit sphere.
-
-        All four callables receive one dict, ``memory``, after their regular arguments and return it (updated)
-        after their result, as ``(result, memory)``. ``forward`` creates it empty before the first iteration, so a
-        new call starts with no memory; every callable reads and writes the same dict. It is available as
-        ``memory_`` after the run.
-        score_fn : optional replacement for the selection score (see ``NeighborScore``; it carries its own
-            parameters and receives ``iteration`` and ``n_iters``). It is used for every neighbour selection,
-            including the initial one: with ``recompute_neighbors=0`` it defines the single neighbour graph the
-            run uses, otherwise it is called again at every reselection.
-        weight_fn : optional replacement for the neighbour weights of the weighted mean (see ``NeighborWeight``;
-            it carries its own parameters and receives ``iteration`` and ``n_iters``). A function you pass is
-            evaluated at the start of **every** iteration, with the current distances to the selected neighbours
-            and the current stability scores, so the weights follow the moving points
-            and the stability updates. The default is used when not given; it only depends on the density and
-            the stability, so it is re-evaluated only when a ``stability_fn`` is given.
+        Every callable above receives the same mutable ``memory`` dict as its final argument and returns the
+        updated dict with its result as ``(result, memory)``. A new run starts with an empty dict; the final dict
+        is available as ``memory_``.
         """
         X = torch.as_tensor(X)
         if X.dim() != 2 or not X.is_floating_point():
@@ -798,7 +794,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
                              f"for n={n} points")
 
         stability = torch.ones(n, dtype=X.dtype, device=X.device)           # every point starts fully stable
-        memory = {}                                                          # shared by the four callables: empty at the start
+        memory = {}                                                          # shared by the five callables: empty at the start
         query_labels, neighbor_labels = self._labels(labels, n)
         score_fn = score_fn if score_fn is not None else self.default_score
         weights_every_iteration = weight_fn is not None or stability_fn is not None or density_fn is not None
@@ -817,6 +813,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             density = torch.ones(n, dtype=x.dtype, device=x.device)         # replaced at the start of every iteration
 
         total_distance = torch.zeros(n, dtype=x.dtype, device=x.device)
+        metric = None
         trajectory = [x.clone()] if self.keep_trajectory else []
         state, indices, nbr_dist, valid, orphan, h, graph_pairs = None, None, None, None, None, None, None
         for iteration in range(n_iters):
@@ -845,17 +842,25 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
             moved = unit(x + self.learning_rate * gate * (mean - x))         # step, then back onto the sphere
             if orphan is not None:
                 moved = torch.where(orphan.unsqueeze(1), x, moved)
-            step = moved - x                                                 # this iteration's step vectors
+            previous = x
+            step = moved - previous                                           # this iteration's step vectors
             change = step.norm(dim=1)
 
             total_distance = total_distance + change
+            stability_before = stability
             x = moved
             if self.keep_trajectory:
                 trajectory.append(x.clone())
             mean_change = change.mean().item()
             logger.debug("iteration %d: mean movement %.6f", iteration + 1, mean_change)
             if stability_fn is not None:
-                stability, memory = update_stability(stability_fn, step, density, stability, h, iteration, n_iters, graph, memory)
+                stability, memory = update_stability(
+                    stability_fn, moved, previous, density, stability_before, h, iteration, n_iters, graph, memory)
+            if metric_fn is not None:
+                metric_step, memory = _call_with_memory(
+                    metric_fn, (moved, previous, density, stability_before, h, iteration, n_iters, graph), memory,
+                    "the metric function")
+                metric = metric_step if metric is None else metric + metric_step
             if mean_change < self.shift_threshold:
                 logger.info("converged after %d iterations", iteration + 1)
                 break
@@ -863,7 +868,7 @@ class MeanShiftDensityEnhancement(torch.nn.Module):
         self.density_ = density                                              # the final density
         self.stability_ = stability                                          # the final scores (1.0 without a stability_fn)
         self.memory_ = memory                                                # the shared memory after the run
-        return x, total_distance, trajectory
+        return x, metric if metric_fn is not None else total_distance, trajectory
 
 
 mean_shift_density_enhancement = MeanShiftDensityEnhancement
